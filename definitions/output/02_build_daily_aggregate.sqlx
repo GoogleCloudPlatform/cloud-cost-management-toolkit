@@ -1,0 +1,211 @@
+/*
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+*/
+
+-- This script builds the daily aggregate table which powers the reports and anomaly views
+config {
+  type: "incremental",
+  tags: ["updateAggregates"],
+  name: dataform.projectConfig.vars.daily_summary_table_name,
+  bigquery: {
+    partitionBy: "usage_start_date",
+    clusterBy: ["project_id", "service_id", "sku_id"],
+    partitionExpirationDays: -1, 
+    requirePartitionFilter: true
+  },
+  description: "Daily aggregated summary of GCP billing export data, partitioned by usage date."
+}
+
+pre_operations {
+   --pre_operations
+      DECLARE v_dates_string STRING;
+      DECLARE v_where_clause STRING;
+      DECLARE v_process_row_id INT64 DEFAULT NULL;
+      DECLARE v_is_incremental BOOLEAN;
+      DECLARE v_target_table_fqn STRING DEFAULT
+        '${self()}';
+      DECLARE v_records_added INT64;
+      DECLARE v_usage_dates_processed ARRAY<DATE>;
+      DECLARE v_max_dest_date DATE;
+
+      -- Get the active process ID for logging.
+      SET v_process_row_id = (
+        SELECT process_id FROM ${ref(dataform.projectConfig.vars.log_table_name)} WHERE process_end_time IS NULL
+      );
+
+      -- Determine the dates that need to be re-processed in the aggregates via usage_dates_processed column 
+      SET v_usage_dates_processed = (
+        SELECT usage_dates_processed FROM ${ref(dataform.projectConfig.vars.log_table_name)} WHERE process_id = v_process_row_id
+      );
+
+      --If the array is empty, run a full refresh. TODO: set load type in step 01? or is this deterministic enough?
+      SET v_is_incremental = ${when(incremental(),`TRUE`,`FALSE`)}
+      ; 
+
+      -- Get the pre-formatted string of dates to process
+        ${when(incremental(),
+        `SET v_dates_string =
+        (SELECT
+          (SELECT
+              FORMAT("'%s'", STRING_AGG(CAST(d AS STRING), "','"))
+            FROM
+              UNNEST(usage_dates_processed) AS d
+          ) AS usage_dates_string
+        FROM
+          ${ref(dataform.projectConfig.vars.log_table_name)}
+        WHERE
+          process_end_time IS NULL
+        )`,
+        `SET v_dates_string = NULL`)} ;
+
+        -- if incremental then delete all dates to reprocess...
+        ${when(incremental(),`
+        IF v_dates_string IS NOT NULL THEN
+          EXECUTE IMMEDIATE FORMAT(
+            "DELETE FROM %s WHERE usage_start_date IN (%s)",
+            v_target_table_fqn,
+            v_dates_string
+          );
+          END IF;`
+        ,`-- ...if not incremental let Dataform regenerate table`)}
+}
+
+  -- Main aggregation query, simplified with a label related subquery and by pulling from the repartitioned table
+    WITH source_with_strings AS (
+        SELECT
+        *
+        EXCEPT (labels, system_labels, tags, project), 
+        STRUCT(billing_export.project.id, billing_export.project.number, billing_export.project.name, billing_export.project.ancestry_numbers) AS project
+        , ARRAY_TO_STRING(ARRAY(SELECT CONCAT(coalesce(key,'No Label Key'), ':::', coalesce(value,'No Label Value')) FROM UNNEST(labels)), ', ') AS all_labels
+        , ARRAY_TO_STRING(ARRAY(SELECT CONCAT(coalesce(key,'No System Label Key'), ':::', coalesce(value,'No System Label Value')) FROM UNNEST(system_labels)), ', ') AS all_system_labels
+        , ARRAY_TO_STRING(ARRAY(SELECT CONCAT(coalesce(key,'No Tag Key'), ':::', coalesce(value,'No Tag Value')) FROM UNNEST(tags)), ', ') AS all_tags
+        , ARRAY_TO_STRING(ARRAY(SELECT CONCAT(coalesce(key,'No Project Label Key'), ':::', coalesce(value,'No Project Label Value')) FROM UNNEST(project.labels)), ', ') AS all_project_labels
+        , ARRAY_TO_STRING(ARRAY(SELECT CONCAT(coalesce(resource_name,'No Resource Name'), ':::', coalesce(display_name,'No Display Name')) FROM UNNEST(project.ancestors)), ', ') AS all_project_ancestors
+        FROM
+        ${ref(dataform.projectConfig.vars.dest_table_name)} as billing_export
+        WHERE
+        ${when(incremental(),`usage_start_date IN UNNEST(v_usage_dates_processed)`,
+        `usage_start_date >= '${dataform.projectConfig.vars.default_start_date}'`)}
+    )
+    SELECT
+        md5(concat(
+        coalesce(billing_export.billing_account_id,'')
+        , coalesce(billing_export.project.id,'')
+        , coalesce(billing_export.project.name,'')
+        , coalesce(billing_export.usage_start_date,DATE('1970-01-01'))
+        , coalesce(billing_export.invoice.month,'')
+        , coalesce(billing_export.sku.description,'')
+        , coalesce(billing_export.sku.id,'')
+        , coalesce(billing_export.service.description,'')
+        , coalesce(billing_export.service.id,'')
+        , coalesce(all_labels, '')
+        , coalesce(all_system_labels, '')
+        , coalesce(all_project_labels, '')
+        , coalesce(all_tags, '')
+        , coalesce(billing_export.location.region,'')
+        , coalesce(billing_export.project.ancestry_numbers,'')
+        , coalesce(billing_export.usage.unit,'')
+        , coalesce(billing_export.consumption_model.id,'')
+        ))  AS pk,
+        billing_export.billing_account_id,
+        billing_export.usage_start_date,
+        billing_export.project.id AS project_id,
+        billing_export.project.name AS project_name,
+        billing_export.sku.description AS sku_description,
+        billing_export.sku.id AS sku_id,
+        billing_export.service.description AS service_description,
+        billing_export.service.id AS service_id,
+        all_labels,
+        all_system_labels,
+        all_tags,
+        all_project_labels,
+        all_project_ancestors,
+        billing_export.location.region AS location_region,
+        billing_export.project.ancestry_numbers AS project_ancestry_numbers,
+        billing_export.transaction_type,
+        billing_export.usage.unit AS usage_unit,
+        billing_export.usage.pricing_unit AS usage_pricing_unit,
+        billing_export.invoice.month AS invoice_month,
+        billing_export.consumption_model.id as consumption_model_id,
+        billing_export.consumption_model.description as consumption_model_description,
+        COALESCE(SUM(billing_export.cost), 0) AS total_cost,
+        COALESCE(SUM(billing_export.cost_at_list), 0) AS total_cost_at_list,
+        COALESCE(SUM(billing_export.cost_at_effective_price_default), 0) AS total_cost_at_effective_price_default,
+        COALESCE(SUM(billing_export.cost_at_list_consumption_model), 0) AS total_cost_at_list_consumption_model,
+        coalesce(sum((SELECT SUM(amount) FROM UNNEST(billing_export.credits))),0) as total_credits,
+        coalesce(sum((SELECT SUM(amount) FROM UNNEST(billing_export.credits) WHERE type = 'DISCOUNT')),0) as total_discount,
+        coalesce(sum((SELECT SUM(amount) FROM UNNEST(billing_export.credits) WHERE type = 'PROMOTION')),0) as total_promotion,
+        coalesce(sum((SELECT SUM(amount) FROM UNNEST(billing_export.credits) WHERE type = 'SUSTAINED_USAGE_DISCOUNT')),0) as total_sud,
+        coalesce(sum((SELECT SUM(amount) FROM UNNEST(billing_export.credits) WHERE type = 'COMMITTED_USAGE_DISCOUNT')),0) as total_rcud, --Resource-Based CUDs
+        coalesce(sum((SELECT SUM(amount) FROM UNNEST(billing_export.credits) WHERE type = 'COMMITTED_USAGE_DISCOUNT_DOLLAR_BASE')),0) as total_fcud_legacy, -- Flex aka Spend-Based CUDs
+        coalesce(sum((SELECT SUM(amount) FROM UNNEST(billing_export.credits) WHERE type = 'FEE_UTILIZATION_OFFSET')),0) as total_fee_utilization_offset_credits, -- New credit to offset costs when already pre-paid with CUD fees
+        coalesce(sum((SELECT SUM(amount) FROM UNNEST(billing_export.credits) WHERE type = 'FREE_TIER')),0) as total_free_tier,
+        coalesce(sum((SELECT SUM(amount) FROM UNNEST(billing_export.credits) WHERE type = 'RESELLER_MARGIN')),0) as total_reseller_margin, 
+        coalesce(sum((SELECT SUM(amount) FROM UNNEST(billing_export.credits) WHERE type = 'SUBSCRIPTION_BENEFIT')),0) as total_subscription_benefit, 
+        coalesce(sum(usage.amount), 0) as total_usage_amount,
+        coalesce(sum(usage.amount_in_pricing_units), 0) as total_usage_amount_in_pricing_units
+    FROM 
+      source_with_strings as billing_export
+    GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22
+
+
+
+
+post_operations {
+  BEGIN
+  -- Finalize the log entry
+  SET v_records_added = @@row_count;
+  
+  IF v_is_incremental THEN
+    -- For an incremental run, the specific dates processed are already in the
+    -- v_usage_dates_processed variable. We use this to find the max date.
+    SET v_max_dest_date = (SELECT MAX(d) FROM UNNEST(v_usage_dates_processed) AS d);
+  ELSE
+    -- For a full refresh, we don't need the full list of dates,
+    SET v_max_dest_date = CURRENT_DATE();
+    -- TODO: Update to max partition date? Removing for now, this seems expensive...
+    -- (
+    --   SELECT MAX(usage_start_date)
+    --   FROM ${ref("usage_partitioned_and_flattened_billing_export")}
+    --   WHERE usage_start_date >= DATE('${dataform.projectConfig.vars.default_start_date}')
+    -- );
+  END IF;
+
+  UPDATE ${ref(dataform.projectConfig.vars.log_table_name)}
+  SET
+    records_added = v_records_added,
+    max_dest_date = v_max_dest_date,
+    process_end_time = CURRENT_TIMESTAMP(),
+    process_msg = CASE WHEN v_is_incremental
+      THEN 'Step 2 Complete: Updated daily aggregate.'
+      ELSE 'Step 2 Complete: FULL REFRESH of daily aggregate.'
+      END,
+    -- Re-assert the max_source_date value from the previous step to ensure it is never NULL on a successful run.
+    max_source_date = (SELECT max_source_date FROM ${ref(dataform.projectConfig.vars.log_table_name)} WHERE process_id = v_process_row_id)
+      WHERE
+        process_id = v_process_row_id;
+
+    EXCEPTION WHEN ERROR THEN
+        -- In case of an error, find the active process again to log the failure.
+        UPDATE ${ref(dataform.projectConfig.vars.log_table_name)}
+        SET
+          process_end_time = CURRENT_TIMESTAMP(),
+          process_msg = @@error.message
+        WHERE
+          process_id = (SELECT MAX(process_id) FROM ${ref(dataform.projectConfig.vars.log_table_name)} WHERE process_end_time IS NULL);
+        
+        RAISE USING MESSAGE = @@error.message;
+    END;
+}

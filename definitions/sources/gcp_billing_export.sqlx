@@ -1,0 +1,30 @@
+/*
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+*/
+
+-- This file declares your source view, to access the raw billing export with a partition filter always enabled.
+-- Dataform now knows this view exists and other files can ${ref()} it.
+config {
+  type: "view",
+  tags: ["createViews"],
+  name: dataform.projectConfig.vars.source_view_name,
+}
+
+SELECT
+    *, _PARTITIONTIME as PARTITIONTIME, _PARTITIONDATE as PARTITIONDATE
+FROM
+    `${dataform.projectConfig.vars.raw_billing_project}.${dataform.projectConfig.vars.raw_billing_dataset}.${dataform.projectConfig.vars.raw_billing_table_name}`
+-- TODO: update hardcoded value to relative date calc (rolling 5 quarters)
+WHERE TIMESTAMP_TRUNC(_PARTITIONTIME, DAY) >= '2024-08-01'

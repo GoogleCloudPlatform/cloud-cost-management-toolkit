@@ -1,0 +1,368 @@
+/*
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+*/
+
+-- This script builds the daily aggregate table which powers the reports and anomaly views
+config {
+  type: "table",
+  name: "gcp_product_categories",
+  description: "Build customer-specific GCP product hierarchy"
+}
+
+  -- Main aggregation query, simplified with a label related subquery and by pulling from the repartitioned table
+WITH BillingDataWithMachineSpec AS (
+  SELECT
+    sku,
+    service,
+    labels,
+    system_labels,
+    -- Extract machine_spec for Compute Engine from system_labels
+    (
+    --   SELECT l.element.value
+    --   FROM UNNEST(system_labels.list) AS l
+    --   WHERE l.element.key = 'compute.googleapis.com/machine_spec'
+    --   LIMIT 1
+    select l.value
+    FROM UNNEST (system_labels) AS l
+    WHERE l.key = 'compute.googleapis.com/machine_spec'
+    LIMIT 1
+    ) AS machine_spec
+  FROM ${ref(dataform.projectConfig.vars.source_view_name)} 
+  WHERE
+    NOT REGEXP_CONTAINS(sku.description, r'Commitment') -- Build dimension on usage
+),
+ClassifiedData AS (
+  SELECT
+    s.sku,
+    s.service,
+    s.machine_spec,
+------------------
+-->>>> LVL 1: ALL/Placeholder for later
+  --  ' ' AS csp_product_lvl1,
+
+-------------------------------
+-->>>> LVL 2: Product Category
+    CASE
+      -- 1. Marketplace AI Vendors (Most Specific)
+      WHEN s.service.description = 'Marketplace' AND EXISTS(
+        SELECT 1 FROM UNNEST(['Anthropic', 'OpenAI', 'Mistral', 'AI21', 'Cohere']) AS vendor
+        WHERE s.sku.description LIKE '%' || vendor || '%'
+      ) THEN 'AI'
+      -- 2. Other Marketplace
+      WHEN s.service.description = 'Marketplace' THEN 'Marketplace'
+
+      -- 3. Compute Engine Breakdowns
+      WHEN s.service.description = 'Compute Engine' THEN
+        CASE
+          -- AI (GPU/TPU Compute)
+          WHEN LOWER(COALESCE(s.machine_spec, '')) LIKE 'a2%' OR LOWER(COALESCE(s.machine_spec, '')) LIKE 'a3%' OR LOWER(COALESCE(s.machine_spec, '')) LIKE 'g2%' --TODO: more machine types?
+            OR s.sku.description LIKE '%GPU%' OR s.sku.description LIKE '%TPU%' THEN 'AI'
+          -- Block Storage (from Compute)
+          WHEN UPPER(s.sku.description) LIKE '%DISK%' OR s.sku.description LIKE '%PD%' OR s.sku.description LIKE '%Snapshot%' OR s.sku.description LIKE '%Local SSD%' THEN 'Block Storage'
+          -- Networking (from Compute)
+          WHEN s.sku.description LIKE '%Egress%' OR s.sku.description LIKE '%Ingress%' OR s.sku.description LIKE '%Network%' OR s.sku.description LIKE '%Load Balanc%' OR s.sku.description LIKE '%IP Address%' OR s.sku.description LIKE '%Data Transfer%' THEN 'Networking'
+          -- Compute VMs
+          WHEN s.machine_spec IS NOT NULL THEN 'Compute'
+          WHEN s.sku.description LIKE '%Compute%' OR s.sku.description LIKE '%Vmimage%' OR s.sku.description LIKE '%Instance%' OR s.sku.description LIKE '%Sole Tenancy%' OR s.sku.description LIKE '%Reservation%' THEN 'Compute'
+          -- Anything else from Compute Engine goes to Others
+          ELSE 'Others'
+        END
+
+      -- 4. Networking from other services
+      WHEN s.service.description IN ('Cloud SQL') AND (s.sku.description LIKE '%Network%') THEN 'Networking'
+
+      -- 5. Service-based classifications
+      WHEN s.service.description IN ('AI Platform', 'Vertex AI', 'AutoML', 'Speech-to-Text', 'Text-to-Speech', 'Natural Language API', 'Translation API', 'Dialogflow API', 'Gemini API') THEN 'AI'
+      WHEN s.service.description IN ('Kubernetes Engine', 'Cloud Functions', 'Cloud Run', 'App Engine','Firebase Hosting','Firebase App Hosting') THEN 'Serverless'
+      WHEN s.service.description IN ('Cloud Storage', 'Filestore', 'Cloud Filestore') THEN 'Storage'
+      WHEN s.service.description IN ('Cloud SQL', 'Cloud Bigtable', 'Cloud Spanner', 'AlloyDB', 'Cloud Memorystore', 'Firestore', 'Datastore', 'Bigtable') THEN 'Databases'
+      WHEN s.service.description IN ('Cloud Key Management Service (KMS)','Security Command Center', 'Cloud Key Management Service', 'Secret Manager', 'Google Cloud Armor', 'Identity Platform', 'Certificate Authority Service') THEN 'Security'
+      WHEN s.service.description IN ('Networking', 'Virtual Private Cloud', 'Cloud DNS', 'Cloud Load Balancing', 'Cloud CDN', 'Cloud Interconnect', 'Cloud VPN', 'NAT Service', 'Network Connectivity Center') OR s.sku.description LIKE '%Data Transfer%' THEN 'Networking'
+
+      -- 6. Explicit 'Others' based on Taxonomy Doc
+      WHEN s.service.description IN (
+        'BigQuery', 'Dataflow', 'Dataproc', 'Pub/Sub',
+        'Cloud Logging', 'Cloud Monitoring', 'Cloud Build', 'Artifact Registry', 'Composer', 'Data Fusion'
+        -- Add any other services from your data that fit the 'Others' description
+      ) THEN 'Others'
+
+      -- 7. Default to 'Others'
+      ELSE 'Others'
+    END AS csp_product_lvl2,
+
+    s.sku.description AS raw_sku_description
+  FROM BillingDataWithMachineSpec s
+)
+SELECT
+-----------------------------------------------------------------------------
+-- !!DEBUGGING
+-- Enable SKU, Service and/or machine details for review, NOTE: will increase row count!
+
+  -- cd.raw_sku_description,
+  -- cd.service.description,
+  -- cd.machine_spec,
+-----------------------------------------------------------------------------
+  cd.sku.id,
+-->>>> lvl 1 
+  --cd.csp_product_lvl1,
+-->>>> lvl 2 
+  cd.csp_product_lvl2,
+-->>>> lvl 3 
+  CASE cd.csp_product_lvl2
+    WHEN 'Compute' THEN -- Section 5.1
+      CASE
+        WHEN cd.machine_spec IS NULL THEN 
+          CASE WHEN cd.raw_sku_description LIKE '%N2%' or cd.raw_sku_description LIKE 'Custom%' THEN 'General Purpose'
+          END
+        -- Approximation based on family prefixes, as exact memory/vCPU ratio is not always available.
+        WHEN STARTS_WITH(LOWER(cd.machine_spec), 'c') THEN 'CPU Optimized'
+        WHEN STARTS_WITH(LOWER(cd.machine_spec), 'm') THEN 'Memory Optimized'
+        --WHEN STARTS_WITH(LOWER(cd.machine_spec), 'custom') or STARTS_WITH(LOWER(TODO: SKU Description starts with custom), 'custom') THEN 'General '
+        WHEN STARTS_WITH(LOWER(cd.machine_spec), 'n') --anything in n & e is General purpose
+          OR STARTS_WITH(LOWER(cd.machine_spec), 'e')
+          OR STARTS_WITH(LOWER(cd.machine_spec), 't') -- TODO: t2 ARM are NOT general purpose?
+        THEN 'General Purpose'
+        ELSE 'General Purpose'
+      END
+    WHEN 'AI' THEN -- Section 6.1
+      CASE
+        WHEN EXISTS(
+          SELECT 1 FROM UNNEST(['Anthropic', 'OpenAI', 'Mistral', 'AI21', 'Cohere']) AS vendor
+          WHERE cd.raw_sku_description LIKE '%' || vendor || '%'
+        ) THEN COALESCE(REGEXP_EXTRACT(cd.raw_sku_description, r'(Anthropic|OpenAI|Mistral|AI21|Cohere)'), 'AI Vendor')
+        WHEN cd.service.description = 'Compute Engine' THEN 'GPU Compute'
+        WHEN cd.service.description = 'Workbench' THEN 'Workbench'
+        ELSE cd.service.description
+      END
+    WHEN 'Storage' THEN cd.service.description -- Section 7
+    WHEN 'Databases' THEN cd.service.description -- Section 8
+    WHEN 'Networking' THEN -- Section 9
+        CASE
+            WHEN cd.raw_sku_description LIKE '%Interconnect%' THEN 'Interconnect'
+            WHEN cd.raw_sku_description LIKE '%Egress%' OR cd.raw_sku_description LIKE '%Ingress%' OR cd.raw_sku_description LIKE '%Data Transfer%' THEN 'Data Transfer'
+            WHEN cd.raw_sku_description LIKE '%Load Balancing%' OR cd.raw_sku_description LIKE '%Load Balance%' THEN 'Load Balancing'
+            WHEN cd.raw_sku_description LIKE '%VPN%' THEN 'VPN'
+            WHEN cd.raw_sku_description LIKE '%NAT%' THEN 'NAT'
+            ELSE cd.service.description
+        END
+    WHEN 'Block Storage' THEN -- Section 10
+        CASE
+          WHEN LOWER(cd.raw_sku_description) LIKE '%snapshot%' THEN 'Snapshots'
+          WHEN cd.raw_sku_description LIKE '%SSD%' THEN 'SSD-based storage'
+          ELSE 'Standard Storage'
+        END 
+    WHEN 'Serverless' THEN cd.service.description
+    WHEN 'Security' THEN cd.service.description
+    WHEN 'Marketplace' THEN cd.service.description
+    ELSE cd.service.description
+  END AS csp_product_lvl3,
+
+  ---------------------------------------------------------------lvl 4------------------------------------------------------------------------------------
+
+  CASE cd.csp_product_lvl2
+    WHEN 'Compute' THEN -- Section 5.2: Processor Type
+      CASE
+        WHEN cd.machine_spec IS NULL THEN ''
+        WHEN LOWER(SPLIT(cd.machine_spec, '-')[SAFE_OFFSET(0)]) LIKE '%d' THEN 'AMD'   -- Ends with d
+        WHEN LOWER(SPLIT(cd.machine_spec, '-')[SAFE_OFFSET(0)]) LIKE '%x' THEN 'Arm'   -- Ends with x
+        WHEN LOWER(SPLIT(cd.machine_spec, '-')[SAFE_OFFSET(0)]) LIKE '%a' THEN 'Arm'   -- Ends with a
+        ELSE 'Intel'
+      END
+    WHEN 'AI' THEN -- Section 6.2: Model or GPU Type
+      CASE
+        WHEN cd.service.description = 'Compute Engine' or cd.service.description = 'Vertex AI' or cd.service.description = 'Gemini API' THEN
+          CASE
+          --GPU Compute
+            WHEN cd.raw_sku_description LIKE '%Nvidia Tesla A100%' THEN 'A100 GPU'
+            WHEN cd.raw_sku_description LIKE '%Nvidia H100%' THEN 'H100 GPU'
+            WHEN cd.raw_sku_description LIKE '%Nvidia L4%' THEN 'L4 GPU'
+            WHEN cd.raw_sku_description LIKE '%Nvidia Tesla T4%' THEN 'T4 GPU'
+            WHEN cd.raw_sku_description LIKE '%Nvidia Tesla P4%' THEN 'P4 GPU'
+            WHEN cd.raw_sku_description LIKE '%Nvidia Tesla V100%' THEN 'V100 GPU'
+            WHEN cd.raw_sku_description LIKE '%Nvidia Tesla K80%' THEN 'K80 GPU'
+            WHEN cd.raw_sku_description LIKE '%Nvidia%' THEN 'Nvidia - Other'
+            WHEN cd.raw_sku_description LIKE '%TPU v5e%' THEN 'TPU v5e'
+            WHEN cd.raw_sku_description LIKE '%TPU v5p%' THEN 'TPU v5p'
+            WHEN cd.raw_sku_description LIKE '%TPU v4%' THEN 'TPU v4'
+            WHEN cd.raw_sku_description LIKE '%TPU%' THEN 'TPU - Other'
+             --GPU Compute --TODO: Don't repeat logic from Compute 5.2
+            WHEN cd.machine_spec IS NOT NULL THEN
+               CASE
+                WHEN LOWER(SPLIT(cd.machine_spec, '-')[SAFE_OFFSET(0)]) LIKE '%d' THEN 'AMD'   -- Ends with d
+                WHEN LOWER(SPLIT(cd.machine_spec, '-')[SAFE_OFFSET(0)]) LIKE '%x' THEN 'Arm'   -- Ends with x
+                WHEN LOWER(SPLIT(cd.machine_spec, '-')[SAFE_OFFSET(0)]) LIKE '%a' THEN 'Arm'   -- Ends with a
+              ELSE 'Intel'
+              END
+          --Vertex AI
+            WHEN cd.raw_sku_description LIKE '%Gemini 2.5 Flash%' THEN 'Gemini 2.5 Flash'
+            WHEN cd.raw_sku_description LIKE '%Gemini 2.5 Pro%' THEN 'Gemini 2.5 Pro'
+            WHEN cd.raw_sku_description LIKE '%Gemini 2.0 Flash%' THEN 'Gemini 2.0 Flash'
+            ELSE ''
+          END
+        WHEN cd.raw_sku_description LIKE '%Anthropic%' THEN COALESCE(REGEXP_EXTRACT(cd.raw_sku_description, r'(Claude [^ ]+)'), '')
+        -- TODO: Add other AI model extractions
+        ELSE ''
+      END
+    WHEN 'Storage' THEN -- Section 7: type
+        CASE
+            WHEN cd.raw_sku_description LIKE '%Storage%' THEN 'Storage'
+            WHEN cd.raw_sku_description LIKE '%Egress%' OR cd.raw_sku_description LIKE '%Data Transfer%' THEN 'Data Transfer'
+            WHEN UPPER(cd.raw_sku_description) LIKE UPPER('%class a%')THEN 'Class A Operations' 
+            WHEN UPPER(cd.raw_sku_description) LIKE UPPER('%class b%')THEN 'Class B Operations' 
+            WHEN cd.raw_sku_description LIKE '%Ops%' OR cd.raw_sku_description LIKE '%Request%' THEN 'Operations'
+            ELSE ''
+        END
+    WHEN 'Databases' THEN -- Section 8: Database engine
+      CASE
+        WHEN cd.raw_sku_description LIKE '%PostgreSQL%' THEN 'PostgreSQL'
+        WHEN cd.raw_sku_description LIKE '%MySQL%' THEN 'MySQL'
+        WHEN cd.raw_sku_description LIKE '%SQL Server%' THEN 'SQL Server'
+        WHEN LOWER(cd.raw_sku_description) LIKE '%redis%' THEN 'Redis'
+        WHEN LOWER(cd.raw_sku_description) LIKE '%memcached%' THEN 'Memcached'
+        WHEN cd.service.description = 'Cloud Bigtable' THEN 'Bigtable'
+        WHEN cd.service.description = 'Cloud Spanner' THEN 'Spanner'
+        WHEN cd.service.description = 'Firestore' THEN 'Firestore'
+        WHEN cd.service.description = 'Datastore' THEN 'Datastore'
+        ELSE ''
+      END
+    WHEN 'Networking' THEN -- Section 9: Direction or variant
+      CASE
+        WHEN cd.raw_sku_description LIKE '%Transfer Out%' THEN 'Egress'
+        WHEN cd.raw_sku_description LIKE '%Transfer In%' THEN 'Ingress'
+        WHEN cd.raw_sku_description LIKE '%Inter Region%' THEN 'Inter-Region'
+        ELSE ''
+      END
+    WHEN 'Block Storage' THEN -- Section 10
+      CASE
+          WHEN cd.raw_sku_description LIKE '%Balanced PD%' or cd.raw_sku_description LIKE '%Hyperdisk Balanced%' THEN 'Balanced'
+          WHEN lower(cd.raw_sku_description) LIKE '%extreme%' THEN 'Extreme'
+          WHEN lower(cd.raw_sku_description) LIKE '%standard%' OR cd.raw_sku_description LIKE '%PD Capacity%' THEN 'Standard'
+          WHEN lower(cd.raw_sku_description) LIKE '%ssd%' THEN 'Local SSD'
+          WHEN cd.raw_sku_description LIKE '%Hyperdisk%' THEN 'High-performance'
+          ELSE ''
+      END
+    WHEN 'Serverless' THEN 
+        CASE
+            WHEN lower(cd.raw_sku_description) LIKE '%pod%' THEN 'Pod'
+            WHEN lower(cd.raw_sku_description) LIKE '%cluster%' THEN 'Cluster'
+            ELSE ''
+        END
+    ELSE ''
+    
+  END AS csp_product_lvl4,
+
+  ---------------------------------------------------------------lvl 5------------------------------------------------------------------------------------
+  CASE cd.csp_product_lvl2
+    WHEN 'Compute' THEN  -- Section 5.3: Instance family
+      CASE
+        WHEN (SPLIT(cd.machine_spec, '-')[SAFE_OFFSET(0)]) = 'custom' THEN 'n1' --Section 5.3: default custom with no machine family to "n1"
+        ELSE SPLIT(cd.machine_spec, '-')[SAFE_OFFSET(0)]
+        END
+    WHEN 'AI' THEN -- Section 6.3: Output Type
+      CASE
+        WHEN LOWER(cd.raw_sku_description) LIKE '%text%' THEN 'Text'
+        WHEN LOWER(cd.raw_sku_description) LIKE '%image%' THEN 'Images'
+        WHEN LOWER(cd.raw_sku_description) LIKE '%video%' THEN 'Video'
+        WHEN LOWER(cd.raw_sku_description) LIKE '%audio%' THEN 'Audio'
+        WHEN cd.machine_spec IS NOT NULL THEN
+          CASE
+            WHEN (SPLIT(cd.machine_spec, '-')[SAFE_OFFSET(0)]) = 'custom' THEN 'n1' --Section 5.3: default custom with no machine family to "n1"
+            ELSE SPLIT(cd.machine_spec, '-')[SAFE_OFFSET(0)]
+            END 
+        ELSE ''
+      END
+      
+    WHEN 'Storage' THEN -- Section 7: Temperature
+        CASE
+            WHEN cd.raw_sku_description LIKE '%Standard%' OR cd.raw_sku_description LIKE '%Regional%' OR cd.raw_sku_description LIKE '%Multi-Regional%' THEN 'Hot'
+            WHEN cd.raw_sku_description LIKE '%Nearline%' THEN 'Warm'
+            WHEN cd.raw_sku_description LIKE '%Coldline%' THEN 'Cold'
+            WHEN cd.raw_sku_description LIKE '%Archive%' THEN 'Cold'
+            ELSE ''
+        END
+    WHEN 'Databases' THEN '' -- Section 8: Instance category or tier
+    -- WHEN 'Networking' THEN -- TODO: Section 9
+    --   CASE
+    --       WHEN cd.raw_sku_description LIKE '%from%' THEN 'Capacity'
+    --       ELSE ''
+    --     END
+    WHEN 'Block Storage' THEN -- Section 10
+      CASE
+          WHEN cd.raw_sku_description LIKE '%Capacity%' THEN 'Capacity'
+          WHEN cd.raw_sku_description LIKE '%Throughput%' THEN 'Throughput'
+          WHEN cd.raw_sku_description LIKE '%IOPS%' THEN 'IOPS'
+          WHEN cd.raw_sku_description LIKE '%Hyperdisk%' THEN 'High-performance'
+          ELSE ''
+        END
+   WHEN 'Serverless' THEN 
+        CASE
+            WHEN lower(cd.raw_sku_description) LIKE '%cpu%' THEN 'Pod'
+            WHEN lower(cd.raw_sku_description) LIKE '%memory%' THEN 'Cluster'
+            ELSE ''
+        END
+    ELSE ''
+  END AS csp_product_lvl5,
+
+  ---------------------------------------------------------------lvl 6------------------------------------------------------------------------------------
+  CASE cd.csp_product_lvl2
+   WHEN 'AI' THEN -- Section 6.4: Usage Type
+      CASE
+        WHEN LOWER(cd.raw_sku_description) LIKE '%input%' THEN 'Input'
+        WHEN LOWER(cd.raw_sku_description) LIKE '%output%' THEN 'Output'
+        WHEN LOWER(cd.raw_sku_description) LIKE '%pipeline%' OR LOWER(cd.raw_sku_description) LIKE '%training%' THEN 'Pipeline'
+        WHEN cd.machine_spec IS NOT NULL THEN
+            CASE 
+              WHEN (SPLIT(cd.machine_spec, '-')[SAFE_OFFSET(0)]) = 'custom' THEN 'custom'
+              ELSE SPLIT(cd.machine_spec, '-')[SAFE_OFFSET(1)]
+            END 
+        ELSE ''
+      END
+   
+    WHEN 'Compute' THEN -- Section 5.3: Configuration type
+      CASE 
+        WHEN (SPLIT(cd.machine_spec, '-')[SAFE_OFFSET(0)]) = 'custom' THEN 'custom'
+        ELSE SPLIT(cd.machine_spec, '-')[SAFE_OFFSET(1)]
+      END
+    WHEN 'Storage' THEN -- Section 7: Storage class
+        CASE
+          WHEN cd.raw_sku_description LIKE '%Standard%' THEN 'Standard'
+          WHEN cd.raw_sku_description LIKE '%Nearline%' THEN 'Nearline'
+          WHEN cd.raw_sku_description LIKE '%Coldline%' THEN 'Coldline'
+          WHEN cd.raw_sku_description LIKE '%Archive%' THEN 'Archive'
+          ELSE ''
+        END
+    WHEN 'Databases' THEN '' -- Section 8: Instance family
+    ELSE ''
+  END AS csp_product_lvl6,
+
+  ---------------------------------------------------------------lvl 7------------------------------------------------------------------------------------
+   
+    CASE cd.csp_product_lvl2
+     WHEN 'AI' THEN -- Section 6.4: Workload Type
+      CASE
+        WHEN LOWER(cd.raw_sku_description) LIKE '%predict%' THEN 'Prediction'
+        WHEN LOWER(cd.raw_sku_description) LIKE '%provisioned through%' THEN 'Provisioned Throughput'
+        WHEN LOWER(cd.raw_sku_description) LIKE '%cach%' THEN 'Caching'
+        WHEN LOWER(cd.raw_sku_description) LIKE '%train%' THEN 'Training'
+        WHEN LOWER(cd.raw_sku_description) LIKE '%tun%' THEN 'Tuning'
+        ELSE cd.machine_spec
+      END
+      ELSE cd.machine_spec  --default to machine_spec, if available
+      END
+     AS csp_product_lvl7,
+
+FROM ClassifiedData cd
+GROUP BY ALL
+order by cd.csp_product_lvl2 desc

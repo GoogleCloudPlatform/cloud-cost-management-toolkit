@@ -1,0 +1,188 @@
+/*
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+*/
+
+config {
+  //disabled: true, // enable if your organization has setup the Recommendations Export
+  type: "table",
+  dependencies: ["00_init_pipeline"],
+  name: "gcp_billing_recommendations",
+  tags: ["updateBaseTables"],
+  description: "Table for latest recommendations from export."
+}
+
+WITH
+  RecommendationsData AS ( 
+-- Filtered BY its OWN latest PARTITION time
+  SELECT
+    t1.*,
+    (
+    SELECT
+      ARRAY_TO_STRING(ARRAY_AGG(REGEXP_EXTRACT(tr, r'.*googleapis.com/projects/([^/]+)/.*')), ", ")
+    FROM
+      UNNEST(t1.target_resources) AS tr ) AS project,
+    ancestors.organization_id AS organization_id,
+    _PARTITIONTIME AS PARTITIONTIME
+  FROM
+    ${ref(dataform.projectConfig.vars.recommendations_table_name)} AS t1
+  WHERE
+    t1._PARTITIONTIME = (
+    SELECT
+      MAX(_PARTITIONTIME)
+    FROM
+      ${ref(dataform.projectConfig.vars.recommendations_table_name)}
+      ) 
+  -- UNION ALL
+  --   -- Query 2: Filtered BY its OWN latest PARTITION time
+  -- SELECT
+  --   t1.*,
+  --   (
+  --   SELECT
+  --     ARRAY_TO_STRING(ARRAY_AGG(REGEXP_EXTRACT(tr, r'.*googleapis.com/projects/([^/]+)/.*')), ", ")
+  --   FROM
+  --     UNNEST(t1.target_resources) AS tr ) AS project,
+  --   ancestors.organization_id AS organization_id,
+  --   _PARTITIONTIME AS PARTITIONTIME
+  -- FROM
+  --   `projid.data_staging.recommendations_export` AS t1
+  -- WHERE
+  --   t1._PARTITIONTIME = (
+  --   SELECT
+  --     MAX(_PARTITIONTIME)
+  --   FROM
+  --     `projid.data_staging.recommendations_export`)
+  -- UNION ALL
+    
+  --   -- Query 3: Filtered BY its OWN latest PARTITION time
+  -- SELECT
+  --   t1.*,
+  --   (
+  --   SELECT
+  --     ARRAY_TO_STRING(ARRAY_AGG(REGEXP_EXTRACT(tr, r'.*googleapis.com/projects/([^/]+)/.*')), ", ")
+  --   FROM
+  --     UNNEST(t1.target_resources) AS tr ) AS project,
+  --   ancestors.organization_id AS organization_id,
+  --   _PARTITIONTIME AS PARTITIONTIME
+  -- FROM
+  --   `projid.data_staging.recommendations_export` AS t1
+  -- WHERE
+  --   t1._PARTITIONTIME = (
+  --   SELECT
+  --     MAX(_PARTITIONTIME)
+  --   FROM
+  --     `projid.data_staging.recommendations_export`)
+   )
+SELECT
+  cloud_entity_type,
+  cloud_entity_id,
+  name AS recommender_name,
+  location,
+  recommender,
+  REPLACE(recommender_subtype, "_", " ") AS recommender_subtype,
+  description,
+  last_refresh_time,
+  TRIM(SPLIT(description, '[Learn more]')[
+  OFFSET
+    (0)]) AS action,
+  REGEXP_EXTRACT(recommendation_details, r'"link": "([^"]*)"') AS link,
+  PROJECT,
+  t1.organization_id,
+  priority,
+  state,
+  (
+  SELECT
+    ARRAY_TO_STRING(ARRAY_AGG(REGEXP_EXTRACT(tr, r'/([^/]+)/[^/]+$')), ", ")
+  FROM
+    UNNEST(t1.target_resources) AS tr) AS resource_type,
+  (
+  SELECT
+    ARRAY_TO_STRING(ARRAY_AGG(REGEXP_EXTRACT(tr, r'/([^/]+)$')), ", ")
+  FROM
+    UNNEST(t1.target_resources) AS tr) AS resource_name,
+  CASE
+    WHEN REGEXP_CONTAINS(recommender, r'google.compute.') THEN 'Compute Engine'
+    WHEN REGEXP_CONTAINS(recommender, r'google.cloudsql.') THEN 'Cloud SQL'
+    WHEN REGEXP_CONTAINS(recommender, r'google.bigquery.') THEN 'BigQuery'
+    WHEN REGEXP_CONTAINS(recommender, r'google.storage.') THEN 'Cloud Storage'
+    WHEN REGEXP_CONTAINS(recommender, r'google.run.') THEN 'Cloud Run'
+    WHEN REGEXP_CONTAINS(recommender, r'google.container.') THEN 'GKE'
+    WHEN REGEXP_CONTAINS(recommender, r'google.iam.') THEN 'IAM'
+    WHEN REGEXP_CONTAINS(recommender, r'google.cloudfunctions.') THEN 'Cloud Functions'
+    WHEN REGEXP_CONTAINS(recommender, r'google.resourcemanager.') THEN 'Resource Manager'
+    ELSE 'Other'
+END
+  AS service,
+  CASE
+    WHEN recommender = 'google.compute.instance.IdleResourceRecommender' THEN 'GCE Idle VM'
+    WHEN recommender = 'google.compute.disk.IdleResourceRecommender' THEN 'GCE Idle Disk'
+    WHEN recommender = 'google.compute.address.IdleResourceRecommender' THEN 'GCE Idle IPs'
+    WHEN recommender = 'google.compute.instance.MachineTypeRecommender' THEN 'GCE Right Sizing'
+    WHEN recommender = 'google.bigquery.capacityCommitments.Recommender' THEN 'BQ Slots'
+    WHEN recommender = 'google.bigquery.table.PartitionClusterRecommender' THEN 'BQ Partitioning Clustering'
+    WHEN recommender = 'google.storage.bucket.SoftDeleteRecommender' THEN 'GCS Bucket Soft Delete'
+    WHEN recommender = 'google.run.service.CostRecommender' THEN 'Cloud Run CPU Allocation'
+    WHEN recommender = 'google.cloudsql.instance.IdleRecommender' THEN 'CloudSQL Idle Instance'
+    WHEN recommender = 'google.cloudsql.instance.OverprovisionedRecommender' THEN 'CloudSQL Instance Overprovision'
+    WHEN recommender = 'google.compute.image.IdleResourceRecommender' THEN 'GCE VM Idle Image'
+    WHEN recommender = 'google.container.DiagnosisRecommender' THEN 'GKE Idle Cluster'
+    WHEN recommender = 'google.compute.IdleResourceRecommender' THEN 'GCE Idle VM Reservations'
+    WHEN recommender = 'google.compute.RightSizeResourceRecommender' THEN 'GCE Underutilized VM Reservations'
+    WHEN recommender = 'google.compute.commitment.UsageCommitmentRecommender' THEN 'GCE CUDs'
+    WHEN recommender = 'google.iam.policy.Recommender' THEN 'IAM Policy'
+    WHEN recommender = 'google.run.service.IdentityRecommender' OR recommender = 'google.run.service.SecurityRecommender' THEN 'Cloud Run Service Security'
+    WHEN recommender = 'google.resourcemanager.projectUtilization.Recommender' THEN 'Unused Projects'
+    WHEN recommender = 'google.cloud.security.GeneralRecommender' THEN 'Advisory Notifications'
+    WHEN recommender = 'google.cloudsql.instance.SecurityRecommender' THEN 'CloudSQL Service Security'
+    WHEN recommender = 'google.storage.bucket.AnywhereCacheRecommender' THEN 'GCS Anywhere Cache'
+    WHEN recommender = 'google.compute.instanceGroupManager.MachineTypeRecommender' THEN 'GCE MIG Machine Type'
+    WHEN recommender = 'google.cloudfunctions.PerformanceRecommender' THEN 'Cloud Functions Instances'
+    WHEN recommender = 'google.cloudsql.instance.PerformanceRecommender' THEN 'CloudSQL Instance Performance'
+    WHEN recommender = 'google.cloudsql.instance.UnderprovisionedRecommender' THEN 'CloudSQL Instance Underprovision'
+    WHEN recommender = 'google.container.DiagnosisRecommender' THEN 'GKE Diagnosis'
+    WHEN recommender = 'google.resourcemanager.serviceLimit.Recommender' THEN 'Service Quota Limits'
+    WHEN recommender = 'google.cloudsql.instance.ReliabilityRecommender' THEN 'CloudSQL Instance Reliability'
+    WHEN recommender = 'google.cloudsql.instance.OutOfDiskRecommender' THEN 'CloudSQL Instance Disk'
+    WHEN recommender = 'google.cloud.RecentChangeRecommender' THEN 'Cloud Configuration Changes'
+    WHEN recommender = 'google.cloud.deprecation.GeneralRecommender' THEN 'Cloud Service Interruptions'
+    ELSE 'Other'
+END
+  AS recommendation_type,
+  primary_impact.category AS impact_category,
+  primary_impact.cost_projection.cost.currency_code AS impact_currency_code,
+  ABS(primary_impact.cost_projection.cost.units) AS impact_cost_unit,
+  primary_impact.cost_projection.cost.nanos AS impact_cost_nanos,
+  primary_impact.cost_projection.cost_in_local_currency.units AS impact_cost_local_currency_units,
+  primary_impact.cost_projection.cost_in_local_currency.nanos AS impact_cost_local_currency_nanos,
+  primary_impact.cost_projection.duration.seconds AS impact_duraction_seconds,
+  primary_impact.cost_projection.duration.nanos AS impact_duration_nanos,
+  primary_impact.cost_projection.pricing_type_name AS pricing_type_name,
+  primary_impact.reliability_projection.risk_types AS risk_types,
+  primary_impact.reliability_projection.details_json AS reliability_details_json,
+FROM (
+  SELECT
+    agg.t.*,
+  FROM (
+    SELECT
+      ARRAY_AGG(STRUCT(t)
+      ORDER BY
+        last_refresh_time DESC)[SAFE_OFFSET(0)].*
+    FROM
+      RecommendationsData AS t
+    CROSS JOIN
+      UNNEST(t.target_resources) AS target_resourc
+      WHERE PARTITIONTIME = (SELECT MAX(PARTITIONTIME) from RecommendationsData)
+    GROUP BY
+      target_resources,
+      recommender_subtype ) AS agg ) AS t1

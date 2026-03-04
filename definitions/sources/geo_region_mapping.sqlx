@@ -1,0 +1,10 @@
+-- This declaration makes the external tenant table "known" to
+-- Dataform's dependency graph, allowing other scripts to use ref().
+
+-- Table is based on a pre_operations in 01_get_forecasts step
+config {
+  type: "declaration",
+  database: dataform.projectConfig.defaultProject,
+  schema: dataform.projectConfig.defaultDataset,
+  name: "geo_region_mapping"
+}

@@ -1,0 +1,96 @@
+/*
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+*/
+
+-- By using type: "operations" and "CREATE TABLE IF NOT EXISTS", 
+-- Dataform will create it only if it's missing, but to NEVER drop or
+-- recreate it on subsequent runs.
+config {
+  type: "operations",
+  tags: ["init"]
+}
+
+--TODO: CREATE DATASET IF NOT EXISTS or this operation will fail the first time run
+
+CREATE TABLE IF NOT EXISTS 
+${ref(dataform.projectConfig.vars.log_table_name)}
+(
+  process_id INT64, -- no parallel processing support, batch only
+  process_name STRING,
+  process_start_time TIMESTAMP,
+  process_end_time TIMESTAMP, -- only set to NON NULL if job completed successfully, this column is populated by the final step.
+  process_msg STRING,
+  source_table STRING, -- source table for raw gcp export partitioned by _PARTITIONTIME
+  dest_table STRING, -- dest table for repartitioned and flattened gcp export
+  records_added INT64,
+  max_source_date DATE, -- used as the "bookmark" for incremental loads to the base table
+  usage_dates_processed ARRAY<DATE>, -- used to track which usage_start_time partitioned to process for downstream aggregates
+  max_dest_date DATE
+);
+
+CREATE TABLE IF NOT EXISTS ${ref("geo_region_mapping")} 
+(
+  gcp_region STRING OPTIONS(description="The technical region code used in Google Cloud Platform (e.g., us-central1)."),
+  geo_name STRING OPTIONS(description="The human-readable location name properly formatted for mapping."),
+  looker_studio_geo_type STRING OPTIONS(description="The specific field type required by Looker Studio to render maps correctly (Country vs Subdivision).")
+)
+AS
+SELECT
+  gcp_region,
+  geo_name,
+  looker_studio_geo_type
+FROM UNNEST([
+  STRUCT<gcp_region STRING, geo_name STRING, looker_studio_geo_type STRING>
+  ('africa-south1', 'South Africa', 'Country'),
+  ('asia-east1', 'Taiwan', 'Country'),
+  ('asia-east2', 'Hong Kong', 'Country'),
+  ('asia-northeast1', 'Japan', 'Country'),
+  ('asia-northeast2', 'Japan', 'Country'),
+  ('asia-northeast3', 'South Korea', 'Country'),
+  ('asia-south1', 'India', 'Country'),
+  ('asia-south2', 'India', 'Country'),
+  ('asia-southeast1', 'Singapore', 'Country'),
+  ('asia-southeast2', 'Indonesia', 'Country'),
+  ('australia-southeast1', 'Australia', 'Country'),
+  ('australia-southeast2', 'Australia', 'Country'),
+  ('europe-central2', 'Poland', 'Country'),
+  ('europe-north1', 'Finland', 'Country'),
+  ('europe-southwest1', 'Spain', 'Country'),
+  ('europe-west1', 'Belgium', 'Country'),
+  ('europe-west2', 'United Kingdom', 'Country'),
+  ('europe-west3', 'Germany', 'Country'),
+  ('europe-west4', 'Netherlands', 'Country'),
+  ('europe-west6', 'Switzerland', 'Country'),
+  ('europe-west8', 'Italy', 'Country'),
+  ('europe-west9', 'France', 'Country'),
+  ('me-central1', 'Qatar', 'Country'),
+  ('me-central2', 'Saudi Arabia', 'Country'),
+  ('me-west1', 'Israel', 'Country'),
+  ('northamerica-northeast1', 'Canada', 'Country'),
+  ('northamerica-northeast2', 'Canada', 'Country'),
+  ('southamerica-east1', 'Brazil', 'Country'),
+  ('southamerica-west1', 'Chile', 'Country'),
+  ('us-central1', 'Iowa', 'Country subdivision (1st level)'),
+  ('us-east1', 'South Carolina', 'Country subdivision (1st level)'),
+  ('us-east4', 'Virginia', 'Country subdivision (1st level)'),
+  ('us-east5', 'Ohio', 'Country subdivision (1st level)'),
+  ('us-south1', 'Texas', 'Country subdivision (1st level)'),
+  ('us-west1', 'Oregon', 'Country subdivision (1st level)'),
+  ('us-west2', 'California', 'Country subdivision (1st level)'),
+  ('us-west3', 'Utah', 'Country subdivision (1st level)'),
+  ('us-west4', 'Nevada', 'Country subdivision (1st level)')
+]);
+
+    

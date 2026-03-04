@@ -1,0 +1,62 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# rename this file to workflow_settings.yaml
+#
+# This file centralizes configuration for your Dataform project.
+
+defaultProject: "<project_id>"
+defaultDataset: "<dataset_id>"
+defaultAssertionDataset: "<same_dataset_id>" # assertions can live in another dataset, if desired
+#defaultLocation: "<region>" # e.g. us-west1
+
+# not currently using package.json, so specifying version here
+dataformCoreVersion: "3.0.26"
+
+# You can access these variables in any .sqlx file using:
+# ${dataform.projectConfig.vars.variable_name}
+vars:
+  # --- General Settings ---
+  log_table_name: "billing_process"
+  default_start_date: "2024-08-01" # Set a safe default for full refreshes # TODO: set to rolling 5 quarters with JS
+
+  # --- Step 0: Initialize Pipeline ---
+  init_process_name: "GCP Billing Export daily ingest"
+  source_view_name: "src_vw_gcp_billing_export_filtered"
+  
+  # --- Step 1: Build Repartitioned Billing Export Table---
+  # Raw physical source table for billing & recommendations exports
+  raw_billing_table_name: "<raw billing export table>"
+  raw_billing_dataset: "<raw billing export dataset>"
+  raw_billing_project: "<raw billing export gcp project>"
+  recommendations_table_name: "recommendations_export"
+  # Destination table for the staging table for GCP billing data, repartitioned on usage_start_date
+  dest_table_name: "usage_partitioned_billing_export"
+  # Other settings
+  billing_source_partition_column: "PARTITIONTIME"
+  billing_source_timezone: "America/Los_Angeles"
+  
+  # --- Step 2: Build Daily Aggregate Summary Table ---
+  daily_summary_table_name: "gcp_billing_export_daily_summary"
+
+  # --- Step 3: Helper Tables for Flattening Array Data ---
+  labels_table_name: "gcp_billing_labels"
+  labels_process_name: "Update GCP billing labels table"
+  project_labels_table_name: "gcp_billing_project_labels"
+  system_labels_table_name: "gcp_billing_system_labels"
+  tags_table_name: "gcp_billing_tags"
+
+  # --- Step 4: Table with Joined Tags and Labels ---
+  daily_left_joined_table_name: "gcp_billing_daily_left_joined"
+

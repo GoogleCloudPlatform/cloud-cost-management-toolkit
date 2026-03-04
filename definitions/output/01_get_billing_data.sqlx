@@ -1,0 +1,118 @@
+/*
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+*/
+
+-- This table is a repartitioned copy of the raw billing export (not to be used for reporting or analytics)
+config {
+  type: "incremental",
+  name: dataform.projectConfig.vars.dest_table_name,
+  dependencies: ["00_init_pipeline", dataform.projectConfig.vars.source_view_name],
+  tags: ["updateBaseTables"],
+  bigquery: {
+    partitionBy: "usage_start_date",
+    partitionExpirationDays: -1, 
+    requirePartitionFilter: true
+  },
+  description: "Copy of the raw GCP billing export table, but partitioned on usage start date."
+}
+
+pre_operations {
+  DECLARE _filter_date DATE DEFAULT (
+    ${when(incremental(),
+    `SELECT MAX(max_source_date) FROM ${ref(dataform.projectConfig.vars.log_table_name)} where process_end_time IS NOT NULL`,
+    `SELECT cast('${dataform.projectConfig.vars.default_start_date}' as date)`)}
+  );
+
+-- TODO: determine latest full partition to use for max_source_date
+
+}
+
+-- Main query
+SELECT
+  source_data.* ,
+  DATE(source_data.usage_start_time, '${dataform.projectConfig.vars.billing_source_timezone}') AS usage_start_date
+FROM
+  ${ref(dataform.projectConfig.vars.source_view_name)} AS source_data
+WHERE
+  source_data.PARTITIONTIME >= TIMESTAMP(_filter_date)
+  AND source_data.PARTITIONTIME < TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), DAY)
+
+post_operations {
+  -- After the main query succeeds, update the log table with run metadata.
+  BEGIN
+    DECLARE v_process_row_id INT64;
+    DECLARE v_run_metadata STRUCT<
+      records_added INT64,
+      usage_dates_processed ARRAY<DATE>,
+      max_processed_partition_date DATE
+    >;
+    DECLARE v_start_of_batch_date DATE;
+
+    -- Find the active process ID.
+    SET v_process_row_id = (
+      SELECT process_id FROM ${ref(dataform.projectConfig.vars.log_table_name)} WHERE process_end_time IS NULL
+    );
+
+    -- Determine the start date for the next batch window (the high-water mark).
+    SET v_start_of_batch_date = (
+      SELECT
+        ${when(incremental(), 
+          `(SELECT COALESCE(MAX(max_source_date), DATE('${dataform.projectConfig.vars.default_start_date}')) 
+            FROM ${ref(dataform.projectConfig.vars.log_table_name)} WHERE process_end_time IS NOT NULL)`,
+          `DATE('${dataform.projectConfig.vars.default_start_date}')`
+        )}
+    );
+
+    -- Gather metadata directly from the source data for this batch to avoid race conditions.
+    -- TODO: this is expensive, we could change to partition checks in I_S and @@row_count?
+    SET v_run_metadata = (
+      SELECT AS STRUCT
+        COUNT(1) as records_added,
+        ARRAY_AGG(DISTINCT DATE(usage_start_time, "${dataform.projectConfig.vars.billing_source_timezone}")) AS usage_dates_processed,
+        COALESCE(MAX(DATE(PARTITIONTIME)), v_start_of_batch_date) as max_processed_partition_date
+      FROM ${ref(dataform.projectConfig.vars.source_view_name)}
+      WHERE PARTITIONTIME > TIMESTAMP(v_start_of_batch_date)
+        --AND PARTITIONTIME < TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), DAY)
+    );
+
+    -- Update the active log row with the correctly determined metadata.
+    UPDATE ${ref(dataform.projectConfig.vars.log_table_name)}
+    SET
+      records_added = v_run_metadata.records_added,
+      -- For incremental runs, store the array of dates (or an empty array if none).
+      -- For full refresh runs, explicitly store NULL.
+      usage_dates_processed = ${when(incremental(), 
+        `COALESCE(v_run_metadata.usage_dates_processed, [])`,
+        `NULL`
+      )},
+      max_source_date = v_run_metadata.max_processed_partition_date,
+      process_msg = "Step 1/2 Complete: Successfully repartitioned billing data."
+    WHERE
+      process_id = v_process_row_id;
+
+  EXCEPTION WHEN ERROR THEN
+    -- If the main query fails, log the error and halt the run.
+    UPDATE ${ref(dataform.projectConfig.vars.log_table_name)}
+    SET
+      process_end_time = CURRENT_TIMESTAMP(),
+      process_msg = @@error.message
+    WHERE
+      process_id = (SELECT MAX(process_id) FROM ${ref(dataform.projectConfig.vars.log_table_name)} WHERE process_end_time IS NULL);
+    
+    RAISE USING MESSAGE = @@error.message;
+  END;
+
+  -- end post_operations block
+}

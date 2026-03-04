@@ -1,0 +1,8 @@
+-- This declaration makes the persistent log table "known" to
+-- Dataform's dependency graph, allowing other scripts to use ref().
+config {
+  type: "declaration",
+  database: dataform.projectConfig.vars.raw_billing_project,
+  schema: dataform.projectConfig.vars.raw_billing_dataset,
+  name: dataform.projectConfig.vars.recommendations_table_name
+} 

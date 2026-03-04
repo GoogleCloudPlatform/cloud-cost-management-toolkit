@@ -1,0 +1,101 @@
+/*
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+*/
+
+-- This script builds the helper table for system labels
+config {
+  //disabled: true,
+  type: "incremental",
+  tags: ["updateTagsLabels"],
+  name: dataform.projectConfig.vars.system_labels_table_name,
+  bigquery: {
+    partitionBy: "usage_start_date",
+    partitionExpirationDays: -1
+  },
+  description: "Helper table to unnest system labels, partitioned by usage date."
+}
+
+pre_operations {
+   -- BEGIN --pre_operations
+      DECLARE v_dates_string STRING;
+      DECLARE v_where_clause STRING;
+      DECLARE v_process_row_id INT64 DEFAULT NULL;
+      DECLARE v_is_incremental BOOLEAN;
+      DECLARE v_target_table_fqn STRING DEFAULT
+        '${self()}';
+      DECLARE v_records_added INT64;
+      DECLARE v_usage_dates_processed ARRAY<DATE>;
+      DECLARE v_max_dest_date DATE;
+
+      -- Get the active process ID for logging.
+      SET v_process_row_id = (
+        SELECT process_id FROM ${ref(dataform.projectConfig.vars.log_table_name)} WHERE process_end_time IS NULL
+      );
+
+      -- Determine the dates that need to be re-processed in the aggregates via usage_dates_processed column 
+      SET v_usage_dates_processed = (
+        SELECT usage_dates_processed FROM ${ref(dataform.projectConfig.vars.log_table_name)} WHERE process_id = v_process_row_id
+      );
+
+      --If the array is empty, run a full refresh. TODO: set load type in step 01? or is this deterministic enough?
+      SET v_is_incremental = ${when(incremental(),`TRUE`,`FALSE`)}
+      ; 
+
+      -- Get the pre-formatted string of dates to process
+        ${when(incremental(),
+        `SET v_dates_string =
+        (SELECT
+          (SELECT
+              FORMAT("'%s'", STRING_AGG(CAST(d AS STRING), "','"))
+            FROM
+              UNNEST(usage_dates_processed) AS d
+          ) AS usage_dates_string
+        FROM
+          ${ref(dataform.projectConfig.vars.log_table_name)} 
+        WHERE
+          process_end_time IS NULL
+        )`,
+        `SET v_dates_string = NULL`)} ;
+
+        -- if incremental then delete all dates to reprocess...
+        ${when(incremental(),`
+        IF v_dates_string IS NOT NULL THEN
+          EXECUTE IMMEDIATE FORMAT(
+            "DELETE FROM %s WHERE usage_start_date IN (%s)",
+            v_target_table_fqn,
+            v_dates_string
+          );
+          END IF;`
+        ,``)}
+}
+
+-- Main query to unnest system labels
+    WITH gcp_export_system_labels as
+    (SELECT
+        pk,
+        usage_start_date,
+        (SELECT SPLIT(trim(label_array),':::')[1] from UNNEST(SPLIT(billing_export.all_system_labels,',')) as label_array where SPLIT(trim(label_array),':::')[0]='compute.googleapis.com/memory') AS memory,
+        (SELECT SPLIT(trim(label_array),':::')[1] from UNNEST(SPLIT(billing_export.all_system_labels,',')) as label_array where SPLIT(trim(label_array),':::')[0]='compute.googleapis.com/cores') AS cores,
+        (SELECT SPLIT(trim(label_array),':::')[1] from UNNEST(SPLIT(billing_export.all_system_labels,',')) as label_array where SPLIT(trim(label_array),':::')[0]='compute.googleapis.com/cores_milliscale_multiplier') AS cores_milliscale_multiplier,
+        (SELECT SPLIT(trim(label_array),':::')[1] from UNNEST(SPLIT(billing_export.all_system_labels,',')) as label_array where SPLIT(trim(label_array),':::')[0]='compute.googleapis.com/machine_spec') AS machine_spec
+    FROM 
+    ${ref(dataform.projectConfig.vars.daily_summary_table_name)} AS billing_export
+    WHERE
+        ${when(incremental(),`usage_start_date IN UNNEST(v_usage_dates_processed)`,
+        `usage_start_date >= '${dataform.projectConfig.vars.default_start_date}'`)}
+    )
+
+    SELECT *
+    FROM gcp_export_system_labels

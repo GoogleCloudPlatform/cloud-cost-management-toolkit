@@ -1,0 +1,152 @@
+/*
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+*/
+
+-- This script builds the helper table for tags
+config {
+  //disabled: true, 
+  type: "incremental",
+  tags: ["updateTagsLabels"],
+  database: dataform.projectConfig.vars.gcp_project_id,
+  schema: dataform.projectConfig.vars.gcp_dataset_id,
+  name: dataform.projectConfig.vars.daily_left_joined_table_name,
+  bigquery: {
+    partitionBy: "usage_start_date",
+    partitionExpirationDays: -1
+  },
+  description: "Left join daily billing with all tags and labels, partitioned by usage date."
+}
+
+pre_operations {
+   -- BEGIN --pre_operations
+      DECLARE v_dates_string STRING;
+      DECLARE v_where_clause STRING;
+      DECLARE v_process_row_id INT64 DEFAULT NULL;
+      DECLARE v_is_incremental BOOLEAN;
+      DECLARE v_target_table_fqn STRING DEFAULT
+        '${self()}';
+      DECLARE v_records_added INT64;
+      DECLARE v_usage_dates_processed ARRAY<DATE>;
+      DECLARE v_max_dest_date DATE;
+
+      -- Get the active process ID for logging.
+      SET v_process_row_id = (
+        SELECT process_id FROM ${ref(dataform.projectConfig.vars.log_table_name)} WHERE process_end_time IS NULL
+      );
+
+      -- Determine the dates that need to be re-processed in the aggregates via usage_dates_processed column 
+      SET v_usage_dates_processed = (
+        SELECT usage_dates_processed FROM ${ref(dataform.projectConfig.vars.log_table_name)} WHERE process_id = v_process_row_id
+      );
+
+      --If the array is empty, run a full refresh. TODO: set load type in step 01? or is this deterministic enough?
+      SET v_is_incremental = ${when(incremental(),`TRUE`,`FALSE`)}
+      ; 
+
+      -- Get the pre-formatted string of dates to process
+        ${when(incremental(),
+        `SET v_dates_string =
+        (SELECT
+          (SELECT
+              FORMAT("'%s'", STRING_AGG(CAST(d AS STRING), "','"))
+            FROM
+              UNNEST(usage_dates_processed) AS d
+          ) AS usage_dates_string
+        FROM
+          ${ref(dataform.projectConfig.vars.log_table_name)}
+        WHERE
+          process_end_time IS NULL
+        )`,
+        `SET v_dates_string = NULL`)} ;
+
+        -- if incremental then delete all dates to reprocess...
+        ${when(incremental(),`
+        IF v_dates_string IS NOT NULL THEN
+          EXECUTE IMMEDIATE FORMAT(
+            "DELETE FROM %s WHERE usage_start_date IN (%s)",
+            v_target_table_fqn,
+            v_dates_string
+          );
+          END IF;`
+        ,``)}
+}
+
+-- Main query
+    SELECT
+      base.*,
+      labels.* EXCEPT (pk, usage_start_date),
+      project_labels.* EXCEPT (pk, usage_start_date),
+      system_labels.* EXCEPT (pk, usage_start_date),
+      tags.* EXCEPT (pk, usage_start_date)
+      --,mapping.* EXCEPT (project_id, project_number) --TODO: Re-add mapping table
+
+    FROM
+      ${ref(dataform.projectConfig.vars.daily_summary_table_name)} AS base
+    LEFT JOIN ${ref(dataform.projectConfig.vars.labels_table_name)}AS labels ON base.pk = labels.pk AND base.usage_start_date = labels.usage_start_date
+    LEFT JOIN ${ref(dataform.projectConfig.vars.project_labels_table_name)} AS project_labels ON base.pk = project_labels.pk
+    LEFT JOIN ${ref(dataform.projectConfig.vars.system_labels_table_name)} AS system_labels ON base.pk = system_labels.pk
+    LEFT JOIN ${ref(dataform.projectConfig.vars.tags_table_name)} AS tags ON base.pk = tags.pk
+    --LEFT JOIN ${ref(dataform.projectConfig.vars.mapping_table_name)} AS mapping ON base.project_id = mapping.project_id
+
+    WHERE
+    ${when(incremental(),`base.usage_start_date IN UNNEST(v_usage_dates_processed)`,
+    `base.usage_start_date >= '${dataform.projectConfig.vars.default_start_date}'`)}
+
+post_operations {
+  BEGIN
+  -- Finalize the log entry
+  SET v_records_added = @@row_count;
+  
+  IF v_is_incremental THEN
+    -- For an incremental run, the specific dates processed are already in the
+    -- v_usage_dates_processed variable. We use this to find the max date.
+    SET v_max_dest_date = (SELECT MAX(d) FROM UNNEST(v_usage_dates_processed) AS d);
+  ELSE
+    -- For a full refresh, we don't need the full list of dates,
+    SET v_max_dest_date = CURRENT_DATE();
+    -- TODO: Update to max partition date? Removing for now, this seems expensive...
+    -- (
+    --   SELECT MAX(usage_start_date)
+    --   FROM ${ref("usage_partitioned_and_flattened_billing_export")}
+    --   WHERE usage_start_date >= DATE('${dataform.projectConfig.vars.default_start_date}')
+    -- );
+  END IF;
+
+  UPDATE ${ref(dataform.projectConfig.vars.log_table_name)}
+  SET
+    records_added = v_records_added,
+    max_dest_date = v_max_dest_date,
+    process_end_time = CURRENT_TIMESTAMP(),
+    process_msg = CASE WHEN v_is_incremental
+      THEN 'Step 3, 4 Complete: Updated daily aggregate with all tags and labels table.'
+      ELSE 'Step 3, 4 Complete: FULL REFRESH of daily aggregate with all tags and labels table.'
+      END,
+    -- Re-assert the max_source_date value from the previous step to ensure it is never NULL on a successful run.
+    max_source_date = (SELECT max_source_date FROM ${ref(dataform.projectConfig.vars.log_table_name)} WHERE process_id = v_process_row_id)
+      WHERE
+        process_id = v_process_row_id;
+
+    EXCEPTION WHEN ERROR THEN
+        -- In case of an error, find the active process again to log the failure.
+        UPDATE ${ref(dataform.projectConfig.vars.log_table_name)}
+        SET
+          process_end_time = CURRENT_TIMESTAMP(),
+          process_msg = @@error.message
+        WHERE
+          process_id = (SELECT MAX(process_id) FROM `${dataform.projectConfig.vars.gcp_project_id}.${dataform.projectConfig.vars.gcp_dataset_id}.${dataform.projectConfig.vars.log_table_name}` WHERE process_end_time IS NULL);
+        
+        RAISE USING MESSAGE = @@error.message;
+    END;
+}

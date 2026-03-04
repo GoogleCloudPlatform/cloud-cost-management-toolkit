@@ -1,0 +1,65 @@
+/*
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+*/
+
+-- This script runs pre-flight checks and logs the start of the pipeline.
+config {
+  type: "operations",
+  tags: ["init"],
+  dependencies: [
+    dataform.projectConfig.vars.log_table_name,
+    "create_process_log"
+  ]
+}
+
+-- Use a BigQuery scripting block to manage pipeline state.
+BEGIN
+  DECLARE pending_processes INT64;
+
+  -- Step 1: Check for any active processes from previous runs.
+  SET pending_processes = (
+    SELECT COUNT(*)
+    FROM ${ref(dataform.projectConfig.vars.log_table_name)}
+    WHERE process_end_time IS NULL
+  );
+    
+  -- Step 2: If an active process is found, fail the run immediately.
+  -- The RAISE statement is not caught by an EXCEPTION block, so it will
+  -- correctly halt the Dataform execution.
+  IF pending_processes > 0 THEN
+    RAISE USING MESSAGE = 'An active process was found from a previous run. Halting execution.';
+  ELSE
+    -- Step 3: No active process found, so we can safely start a new run by
+    -- inserting a single new row for this entire pipeline execution.
+    INSERT INTO ${ref(dataform.projectConfig.vars.log_table_name)} (
+      process_id,
+      process_name,
+      process_start_time,
+      process_msg,
+      source_table,
+      dest_table
+    )
+    VALUES
+      (
+        (SELECT COALESCE(MAX(process_id), 0) + 1 FROM ${ref(dataform.projectConfig.vars.log_table_name)}),
+        '${dataform.projectConfig.vars.init_process_name}',
+        CURRENT_TIMESTAMP(),
+        'Starting new pipeline run.',
+        '${dataform.projectConfig.vars.source_view_name}',
+        '${dataform.projectConfig.vars.dest_table_name}' --TODO: add full path to tables
+      );
+  END IF;
+END
+
