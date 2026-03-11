@@ -89,10 +89,12 @@ pre_operations {
         EXCEPT (labels, system_labels, tags, project), 
         STRUCT(billing_export.project.id, billing_export.project.number, billing_export.project.name, billing_export.project.ancestry_numbers) AS project
         , ARRAY_TO_STRING(ARRAY(SELECT CONCAT(coalesce(key,'No Label Key'), ':::', coalesce(value,'No Label Value')) FROM UNNEST(labels)), ', ') AS all_labels
-        , ARRAY_TO_STRING(ARRAY(SELECT CONCAT(coalesce(key,'No System Label Key'), ':::', coalesce(value,'No System Label Value')) FROM UNNEST(system_labels)), ', ') AS all_system_labels
-        , ARRAY_TO_STRING(ARRAY(SELECT CONCAT(coalesce(key,'No Tag Key'), ':::', coalesce(value,'No Tag Value')) FROM UNNEST(tags)), ', ') AS all_tags
-        , ARRAY_TO_STRING(ARRAY(SELECT CONCAT(coalesce(key,'No Project Label Key'), ':::', coalesce(value,'No Project Label Value')) FROM UNNEST(project.labels)), ', ') AS all_project_labels
-        , ARRAY_TO_STRING(ARRAY(SELECT CONCAT(coalesce(resource_name,'No Resource Name'), ':::', coalesce(display_name,'No Display Name')) FROM UNNEST(project.ancestors)), ', ') AS all_project_ancestors
+         -- Add ORDER BY key to guarantee consistent string output
+        , ARRAY_TO_STRING(ARRAY(SELECT CONCAT(coalesce(key,'No Label Key'), ':::', coalesce(value,'No Label Value')) FROM UNNEST(labels) ORDER BY key), ', ') AS all_labels
+        , ARRAY_TO_STRING(ARRAY(SELECT CONCAT(coalesce(key,'No System Label Key'), ':::', coalesce(value,'No System Label Value')) FROM UNNEST(system_labels) ORDER BY key), ', ') AS all_system_labels
+        , ARRAY_TO_STRING(ARRAY(SELECT CONCAT(coalesce(key,'No Tag Key'), ':::', coalesce(value,'No Tag Value')) FROM UNNEST(tags) ORDER BY key), ', ') AS all_tags
+        , ARRAY_TO_STRING(ARRAY(SELECT CONCAT(coalesce(key,'No Project Label Key'), ':::', coalesce(value,'No Project Label Value')) FROM UNNEST(project.labels) ORDER BY key), ', ') AS all_project_labels
+        , ARRAY_TO_STRING(ARRAY(SELECT CONCAT(coalesce(resource_name,'No Resource Name'), ':::', coalesce(display_name,'No Display Name')) FROM UNNEST(project.ancestors) ORDER BY resource_name), ', ') AS all_project_ancestors
         FROM
         ${ref(dataform.projectConfig.vars.dest_table_name)} as billing_export
         WHERE
