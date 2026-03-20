@@ -21,8 +21,8 @@ defaultDataset: "<dataset_id>"
 defaultAssertionDataset: "<same_dataset_id>" # assertions can live in another dataset, if desired
 #defaultLocation: "<region>" # e.g. us-west1
 
-# not currently using package.json, so specifying version here
-dataformCoreVersion: "3.0.26"
+# use value from workspace init
+# dataformCoreVersion: "3.0.26"
 
 # You can access these variables in any .sqlx file using:
 # ${dataform.projectConfig.vars.variable_name}
