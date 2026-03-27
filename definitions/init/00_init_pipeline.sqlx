@@ -17,7 +17,6 @@
 -- This script runs pre-flight checks and logs the start of the pipeline.
 config {
   type: "operations",
-  tags: ["init"],
   dependencies: [
     dataform.projectConfig.vars.log_table_name,
     "create_process_log"

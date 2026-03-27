@@ -188,7 +188,7 @@ post_operations {
   SET
     records_added = v_records_added,
     max_dest_date = v_max_dest_date,
-    process_end_time = CURRENT_TIMESTAMP(),
+   -- process_end_time = CURRENT_TIMESTAMP(),
     process_msg = CASE WHEN v_is_incremental
       THEN 'Step 2 Complete: Updated daily aggregate.'
       ELSE 'Step 2 Complete: FULL REFRESH of daily aggregate.'

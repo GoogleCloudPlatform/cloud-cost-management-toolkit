@@ -16,15 +16,70 @@
 
 -- Summarizes on a daily project basis for use in time series modeling (forecasts and anomaly alerting)
 config {
-    type: "table",
+    type: "incremental",  //TODO: make an MV for most customers?
     name: "project_daily_spend",
-    tags: ["createViews"],
+    //tags: ["createViews"],
     description: "View used by anomaly pipeline for input to ARIMA.",
-    bigquery: {
+     bigquery: {
         partitionBy: "usage_start_date",
-        clusterBy: ["project_id"],
-    }
+         clusterBy: ["project_id"],
+     }
 }
+
+pre_operations {
+   --pre_operations
+      DECLARE v_dates_string STRING;
+      DECLARE v_where_clause STRING;
+      DECLARE v_process_row_id INT64 DEFAULT NULL;
+      DECLARE v_is_incremental BOOLEAN;
+      DECLARE v_target_table_fqn STRING DEFAULT
+        '${self()}';
+      DECLARE v_records_added INT64;
+      DECLARE v_usage_dates_processed ARRAY<DATE>;
+      DECLARE v_max_dest_date DATE;
+
+      -- Get the active process ID for logging.
+      SET v_process_row_id = (
+        SELECT process_id FROM ${ref(dataform.projectConfig.vars.log_table_name)} WHERE process_end_time IS NULL
+      );
+
+      -- Determine the dates that need to be re-processed in the aggregates via usage_dates_processed column 
+      SET v_usage_dates_processed = (
+        SELECT usage_dates_processed FROM ${ref(dataform.projectConfig.vars.log_table_name)} WHERE process_id = v_process_row_id
+      );
+
+      --If the array is empty, run a full refresh. TODO: set load type in step 01? or is this deterministic enough?
+      SET v_is_incremental = ${when(incremental(),`TRUE`,`FALSE`)}
+      ; 
+
+      -- Get the pre-formatted string of dates to process
+        ${when(incremental(),
+        `SET v_dates_string =
+        (SELECT
+          (SELECT
+              FORMAT("'%s'", STRING_AGG(CAST(d AS STRING), "','"))
+            FROM
+              UNNEST(usage_dates_processed) AS d
+          ) AS usage_dates_string
+        FROM
+          ${ref(dataform.projectConfig.vars.log_table_name)}
+        WHERE
+          process_end_time IS NULL
+        )`,
+        `SET v_dates_string = NULL`)} ;
+
+        -- if incremental then delete all dates to reprocess...
+        ${when(incremental(),`
+        IF v_dates_string IS NOT NULL THEN
+          EXECUTE IMMEDIATE FORMAT(
+            "DELETE FROM %s WHERE usage_start_date IN (%s)",
+            v_target_table_fqn,
+            v_dates_string
+          );
+          END IF;`
+        ,`-- ...if not incremental let Dataform regenerate table`)}
+}
+
 
 SELECT
   project_id,
@@ -33,8 +88,10 @@ SELECT
   SUM(total_net_cost) AS total_net_cost
 FROM
   ${ref("vw_gcp_billing_export_daily_summary")}
-WHERE
-  usage_start_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 400 DAY)
+        WHERE
+        ${when(incremental(),`usage_start_date IN UNNEST(v_usage_dates_processed)`,
+        `usage_start_date >= '${dataform.projectConfig.vars.default_start_date}'`)}
+        
 GROUP BY
   1,
   2,

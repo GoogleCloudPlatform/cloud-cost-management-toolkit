@@ -1,0 +1,33 @@
+config {
+  type: "operations",
+  dependencies: [
+    dataform.projectConfig.vars.daily_left_joined_table_name
+  ]
+}
+
+
+BEGIN
+  
+  DECLARE v_process_row_id INT64 DEFAULT NULL;
+
+  -- Get the active process ID for logging.
+  SET v_process_row_id = (
+    SELECT process_id FROM ${ref(dataform.projectConfig.vars.log_table_name)} WHERE process_end_time IS NULL
+    );
+
+  UPDATE ${ref(dataform.projectConfig.vars.log_table_name)}
+    SET process_end_time = CURRENT_TIMESTAMP()
+      WHERE
+        process_id = v_process_row_id;
+
+    EXCEPTION WHEN ERROR THEN
+        -- In case of an error, find the active process again to log the failure.
+        UPDATE ${ref(dataform.projectConfig.vars.log_table_name)}
+        SET
+          process_end_time = CURRENT_TIMESTAMP(),
+          process_msg = @@error.message
+        WHERE
+          process_id = (SELECT MAX(process_id) FROM ${ref(dataform.projectConfig.vars.log_table_name)} WHERE process_end_time IS NULL);
+        
+        RAISE USING MESSAGE = @@error.message;
+END;
