@@ -41,6 +41,11 @@ vars:
   raw_billing_dataset: "<raw billing export dataset>"
   raw_billing_project: "<raw billing export gcp project>"
   recommendations_table_name: "recommendations_export"
+  # --- if Azure exports are available, enable these tasks
+  raw_azure_table_name: "<raw Azure billing export table>"
+  raw_azure_dataset: "<raw Azure billing export dataset>"
+  azure_advisor_table_name: "azure_advisor"
+
   # Destination table for the staging table for GCP billing data, repartitioned on usage_start_date
   dest_table_name: "usage_partitioned_billing_export"
   # Other settings
