@@ -1,0 +1,768 @@
+/*
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+*/
+
+config {
+  disabled: true,
+  type: "table",
+  name: "azure_product_categories",
+  description: "Example of generating a customer-specific Azure product hierarchy"
+}
+
+
+WITH BillingDataWithSKU AS (
+    SELECT DISTINCT
+        MeterCategory as meter_category,
+        MeterSubCategory as meter_sub_category,
+        MeterName as meter_name,
+        MeterRegion as meter_region,
+        upper(ConsumedService) as consumed_service,
+        UnitOfMeasure as unit_of_measure,
+        PublisherType as publisher_type,
+        -- Only preserve publisher_name for Marketplace rows to avoid grain fan-out
+        CASE WHEN UPPER(PublisherType) = 'MARKETPLACE' THEN PublisherName ELSE '' END as publisher_name,
+        ChargeType as charge_type,
+        PricingModel as pricing_model,
+        Term as term
+        -- ,date as usage_date,
+        -- CAST(DATE_TRUNC(date, MONTH) AS DATE) as sys__partition_monthly,
+      FROM ${ref("azure_costs_export")} 
+),
+
+AggregatedSKUs AS (
+    SELECT
+        s.meter_category,
+        s.meter_sub_category,
+        s.meter_name,
+        s.meter_region,
+        s.consumed_service,
+        s.publisher_name,
+        any_value(s.unit_of_measure) as unit_of_measure,
+        any_value(s.publisher_type) as publisher_type,
+        any_value(CASE WHEN s.charge_type IN ('Purchase', 'Refund', 'UnusedReservation', 'UnusedSavingsPlan') THEN 1 ELSE 0 END) as is_commitment,
+        any_value(s.pricing_model) as pricing_model,
+        any_value(s.term) as term
+        -- CAST(MIN(s.usage_date) AS DATE) as billing_period_start,
+        -- CAST(MAX(s.usage_date) AS DATE) as billing_period_end
+        -- s.sys__partition_monthly
+    FROM BillingDataWithSKU s
+    GROUP BY
+        s.meter_category,
+        s.meter_sub_category,
+        s.meter_name,
+        s.meter_region,
+        s.consumed_service,
+        s.publisher_name
+        -- s.sys__partition_monthly
+),
+
+ClassifiedData AS (
+    SELECT
+        s.meter_category,
+        s.meter_sub_category,
+        s.meter_name,
+        s.meter_region,
+        s.consumed_service,
+        s.publisher_name,
+        s.unit_of_measure,
+        s.publisher_type,
+        s.pricing_model,
+        s.term,
+        -- s.billing_period_start,
+        -- s.billing_period_end,
+        -- s.sys__partition_monthly,
+
+        'All' AS csp_product_lvl1,
+
+        -- LVL 2: Product Category (priority order matters for overlapping services)
+        CASE
+            -- 0. Marketplace
+            WHEN UPPER(s.publisher_type) = 'MARKETPLACE'
+            THEN 'Marketplace'
+
+            -- 1. Commitments & Capacity
+            WHEN s.is_commitment = 1
+            THEN 'Commitments & Capacity'
+
+            -- 2. AI
+            WHEN UPPER(s.consumed_service) IN (
+                'MICROSOFT.COGNITIVESERVICES',
+                'MICROSOFT.MACHINELEARNINGSERVICES',
+                'MICROSOFT.BOTSERVICE',
+                'MICROSOFT.DATABRICKS'
+            )
+            OR UPPER(s.meter_category) LIKE '%COGNITIVE SERVICES%'
+            OR UPPER(s.meter_category) LIKE '%OPENAI%'
+            OR UPPER(s.meter_category) LIKE '%MACHINE LEARNING%'
+            OR UPPER(s.meter_category) LIKE '% AI %'  -- Word boundary to avoid matching "CONTAINER"
+            OR UPPER(s.meter_category) LIKE 'AI %'    -- AI at start
+            OR UPPER(s.meter_category) LIKE '% AI'    -- AI at end
+            OR UPPER(s.meter_sub_category) LIKE '%NC%SERIES%'
+            OR UPPER(s.meter_sub_category) LIKE '%ND%SERIES%'
+            OR UPPER(s.meter_sub_category) LIKE '%NV%SERIES%'
+            OR UPPER(s.meter_sub_category) LIKE '%GPU%'
+            THEN 'AI'
+
+            -- 3a. Compute (excluding AI GPU series)
+            WHEN (
+                    UPPER(s.consumed_service) = 'MICROSOFT.COMPUTE'
+                    AND UPPER(s.meter_category) IN ('VIRTUAL MACHINES', 'AZURE VIRTUAL MACHINES')
+                    AND NOT (
+                        UPPER(s.meter_sub_category) LIKE '%NC%SERIES%'
+                        OR UPPER(s.meter_sub_category) LIKE '%ND%SERIES%'
+                        OR UPPER(s.meter_sub_category) LIKE '%NV%SERIES%'
+                        OR UPPER(s.meter_sub_category) LIKE '%GPU%'
+                    )
+                )
+                OR UPPER(s.consumed_service) = 'MICROSOFT.AVS'
+                OR UPPER(s.meter_category) LIKE '%VMWARE%'
+            THEN 'Compute'
+
+            -- 3b. Block Storage
+            WHEN UPPER(s.consumed_service) = 'MICROSOFT.COMPUTE'
+                AND (
+                    UPPER(s.meter_category) IN ('STORAGE', 'MANAGED DISKS')
+                    OR UPPER(s.meter_sub_category) LIKE '%MANAGED DISK%'
+                    OR UPPER(s.meter_sub_category) LIKE '%SNAPSHOT%'
+                    OR UPPER(s.meter_name) LIKE '%DISK%'
+                )
+            THEN 'Block Storage'
+
+            -- 4. Security (before Serverless/Storage/Databases — Defender spans those consumed_services)
+            WHEN UPPER(s.consumed_service) IN (
+                'MICROSOFT.KEYVAULT',
+                'MICROSOFT.SECURITY',
+                'MICROSOFT.AAD'
+            )
+            OR UPPER(s.meter_category) IN (
+                'KEY VAULT',
+                'SECURITY CENTER',
+                'AZURE ACTIVE DIRECTORY',
+                'SENTINEL',
+                'MICROSOFT DEFENDER FOR CLOUD',
+                'AZURE FIREWALL'
+            )
+            THEN 'Security'
+
+            -- 5a. Serverless
+            WHEN UPPER(s.consumed_service) IN (
+                'MICROSOFT.WEB',
+                'MICROSOFT.CONTAINERINSTANCE',
+                'MICROSOFT.CONTAINERREGISTRY',
+                'MICROSOFT.CONTAINERSERVICE',
+                'MICROSOFT.APP',
+                'MICROSOFT.LOGIC',
+                'MICROSOFT.EVENTGRID',
+                'MICROSOFT.EVENTHUB',
+                'MICROSOFT.SIGNALRSERVICE'
+            )
+            OR UPPER(s.meter_category) IN (
+                'AZURE APP SERVICE',
+                'FUNCTIONS',
+                'CONTAINER INSTANCES',
+                'CONTAINER REGISTRY',
+                'AZURE KUBERNETES SERVICE',
+                'AZURE CONTAINER APPS',
+                'LOGIC APPS',
+                'EVENT GRID',
+                'EVENT HUBS',
+                'SIGNALR'
+            )
+            THEN 'Serverless'
+
+            -- 5b. Storage
+            WHEN (
+                UPPER(s.consumed_service) IN (
+                    'MICROSOFT.STORAGE',
+                    'MICROSOFT.DATALAKESTORE',
+                    'MICROSOFT.NETAPP',
+                    'MICROSOFT.BACKUP',
+                    'MICROSOFT.RECOVERYSERVICES'
+                )
+                -- Exclude Pattern 1 only: consumed_service=microsoft.storage + meter_category=bandwidth → Networking
+                AND NOT (
+                    UPPER(s.consumed_service) = 'MICROSOFT.STORAGE'
+                    AND UPPER(s.meter_category) = 'BANDWIDTH'
+                )
+            )
+            OR UPPER(s.meter_category) IN (
+                'STORAGE',
+                'AZURE BLOB STORAGE',
+                'AZURE FILES',
+                'AZURE DATA LAKE STORAGE',
+                'AZURE NETAPP FILES',
+                'BACKUP'
+            )
+            THEN 'Storage'
+
+            -- 5c. Databases
+            WHEN UPPER(s.consumed_service) IN (
+                'MICROSOFT.SQL',
+                'MICROSOFT.DOCUMENTDB',
+                'MICROSOFT.DBFORPOSTGRESQL',
+                'MICROSOFT.DBFORMYSQL',
+                'MICROSOFT.DBFORMARIADB',
+                'MICROSOFT.CACHE',
+                'MICROSOFT.SYNAPSE',
+                'MICROSOFT.FABRIC'
+            )
+            OR UPPER(s.meter_category) IN (
+                'SQL DATABASE',
+                'AZURE SQL DATABASE',
+                'SQL MANAGED INSTANCE',
+                'AZURE COSMOS DB',
+                'AZURE DATABASE FOR MYSQL',
+                'AZURE DATABASE FOR POSTGRESQL',
+                'AZURE DATABASE FOR MARIADB',
+                'REDIS CACHE',
+                'AZURE SYNAPSE ANALYTICS',
+                'SYNAPSE ANALYTICS',
+                'MICROSOFT FABRIC'
+            )
+            THEN 'Databases'
+
+            -- 5d. Networking
+            WHEN UPPER(s.consumed_service) IN (
+                'MICROSOFT.NETWORK',
+                'MICROSOFT.CDN',
+                'MICROSOFT.FRONTDOOR'
+            )
+            OR UPPER(s.meter_category) IN (
+                'VIRTUAL NETWORK',
+                'BANDWIDTH',
+                'LOAD BALANCER',
+                'VPN GATEWAY',
+                'APPLICATION GATEWAY',
+                'EXPRESSROUTE',
+                'AZURE FRONT DOOR SERVICE',
+                'CONTENT DELIVERY NETWORK'
+            )
+            OR UPPER(s.meter_sub_category) LIKE '%DATA TRANSFER%'
+            THEN 'Networking'
+
+            -- 6. Default to Others
+            ELSE 'Others'
+        END AS csp_product_lvl2
+
+    FROM AggregatedSKUs s
+)
+
+SELECT
+    -- CURRENT_TIMESTAMP as created_on,
+    -- cd.billing_period_start,
+    -- cd.billing_period_end,
+    -- cd.sys__partition_monthly,
+    cd.publisher_type,
+
+    -- 6-field composite key
+    cd.meter_category,
+    cd.meter_sub_category,
+    cd.meter_name,
+    cd.meter_region,
+    cd.consumed_service,
+    cd.publisher_name,
+    cd.unit_of_measure,
+
+    cd.csp_product_lvl1,
+    cd.csp_product_lvl2,
+
+    -- lvl 3: Product Subcategory
+    CASE cd.csp_product_lvl2
+        WHEN 'Compute' THEN
+            CASE
+                -- Eb/Mb must come before D-series and B-series (Ebdsv5 contains 'DDSV5')
+                WHEN UPPER(cd.meter_sub_category) LIKE '%EB%SERIES%'
+                THEN 'Memory Optimized'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%MB%SERIES%'
+                THEN 'Memory Optimized'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%DADSV5%' OR UPPER(cd.meter_sub_category) LIKE '%DASV5%'
+                    OR UPPER(cd.meter_sub_category) LIKE '%DDSV5%' OR UPPER(cd.meter_sub_category) LIKE '%DSV5%'
+                    OR UPPER(cd.meter_sub_category) LIKE '%DAV4%' OR UPPER(cd.meter_sub_category) LIKE '%DV4%'
+                    OR UPPER(cd.meter_sub_category) LIKE '%D SERIES%'
+                    OR UPPER(cd.meter_sub_category) LIKE '%AV2%SERIES%'
+                THEN 'General Purpose'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%EADSV%' OR UPPER(cd.meter_sub_category) LIKE '%EASV%'
+                    OR UPPER(cd.meter_sub_category) LIKE '%EDSV%' OR UPPER(cd.meter_sub_category) LIKE '%ESV%'
+                    OR UPPER(cd.meter_sub_category) LIKE '%EAV%' OR UPPER(cd.meter_sub_category) LIKE '%EV%SERIES%'
+                    OR UPPER(cd.meter_sub_category) LIKE '%E SERIES%'
+                THEN 'Memory Optimized'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%M SERIES%'
+                    OR UPPER(cd.meter_sub_category) LIKE 'MSV%'
+                    OR UPPER(cd.meter_sub_category) LIKE '%MEDIUM MEMORY%'
+                THEN 'Memory Optimized'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%F%SERIES%'
+                THEN 'Compute Optimized'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%L SERIES%'
+                THEN 'Storage Optimized'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%B%SERIES%'
+                    OR UPPER(cd.meter_sub_category) LIKE '%BURSTABLE%'
+                THEN 'Burstable'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%A SERIES%'
+                THEN 'Basic'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%G SERIES%'
+                THEN 'Memory and Storage Intensive'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%HB%SERIES%'
+                    OR UPPER(cd.meter_sub_category) LIKE '%HC%SERIES%'
+                THEN 'HPC'
+                WHEN UPPER(cd.consumed_service) = 'MICROSOFT.AVS'
+                    OR UPPER(cd.meter_category) LIKE '%VMWARE%'
+                THEN 'VMware Solution'
+                ELSE 'General Purpose'
+            END
+
+        WHEN 'AI' THEN
+            CASE
+                WHEN UPPER(cd.meter_sub_category) LIKE '%NC%SERIES%'
+                    OR UPPER(cd.meter_sub_category) LIKE '%ND%SERIES%'
+                    OR UPPER(cd.meter_sub_category) LIKE '%NV%SERIES%'
+                THEN 'GPU VM'
+                -- L3 derived from meter_category (preserves historic platform at time of charge)
+                WHEN UPPER(cd.meter_category) = 'FOUNDRY MODELS'
+                THEN 'Foundry Models'
+                WHEN UPPER(cd.meter_category) = 'FOUNDRY TOOLS'
+                THEN 'Foundry Tools'
+                WHEN UPPER(cd.meter_category) LIKE '%COGNITIVE%'
+                THEN 'Cognitive Services'
+                WHEN UPPER(cd.meter_category) LIKE '%DATABRICKS%' THEN 'Azure Databricks'
+                WHEN UPPER(cd.meter_category) LIKE '%MACHINE LEARNING%' THEN 'Machine Learning'
+                ELSE cd.meter_category
+            END
+
+        WHEN 'Storage' THEN
+            CASE
+                -- meter_category-level matches (dedicated Azure categories)
+                WHEN UPPER(cd.meter_category) LIKE '%BLOB%' THEN 'Blob'
+                WHEN UPPER(cd.meter_category) LIKE '%FILES%' THEN 'File'
+                WHEN UPPER(cd.meter_category) LIKE '%DATA LAKE%' THEN 'Data Lake'
+                WHEN UPPER(cd.meter_category) LIKE '%NETAPP%' THEN 'NetApp Files'
+                WHEN UPPER(cd.meter_category) = 'BACKUP'
+                    OR UPPER(cd.consumed_service) IN ('MICROSOFT.BACKUP', 'MICROSOFT.RECOVERYSERVICES')
+                THEN 'Backup'
+                -- meter_sub_category extraction (for generic meter_category = 'Storage')
+                WHEN UPPER(cd.meter_sub_category) LIKE '%BANDWIDTH%' THEN 'Data Transfer'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%BLOCK BLOB%' THEN 'Blob'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%PAGE BLOB%' THEN 'Page'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%FILES%' THEN 'File'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%TABLES%' THEN 'Table'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%QUEUES%' THEN 'Queue'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%DATA LAKE%'
+                    OR UPPER(cd.meter_sub_category) LIKE '%HIERARCHICAL NAMESPACE%'
+                THEN 'Data Lake'
+                -- meter_sub_category='Bandwidth' (geo-replication) → 'Data Transfer' at L3, 'Geo Replication' at L4
+                WHEN UPPER(cd.meter_sub_category) LIKE '%BLOB FEATURES%'
+                    OR UPPER(cd.meter_sub_category) LIKE '%CHANGE FEED%'
+                THEN 'Blob'
+                ELSE 'Storage'
+            END
+
+        WHEN 'Databases' THEN
+            CASE
+                WHEN UPPER(cd.meter_category) LIKE '%SQL DATABASE%' THEN 'SQL Database'
+                WHEN UPPER(cd.meter_category) LIKE '%SQL MANAGED INSTANCE%' THEN 'SQL Managed Instance'
+                WHEN UPPER(cd.meter_category) LIKE '%SYNAPSE%' THEN 'Synapse Analytics'
+                WHEN UPPER(cd.consumed_service) = 'MICROSOFT.SYNAPSE' THEN 'Synapse Analytics'
+                WHEN UPPER(cd.meter_category) LIKE '%COSMOS%' THEN 'Cosmos DB'
+                WHEN UPPER(cd.meter_category) LIKE '%MYSQL%' THEN 'MySQL'
+                WHEN UPPER(cd.meter_category) LIKE '%POSTGRESQL%' THEN 'PostgreSQL'
+                WHEN UPPER(cd.meter_category) LIKE '%MARIADB%' THEN 'MariaDB'
+                WHEN UPPER(cd.meter_category) LIKE '%REDIS%' THEN 'Azure Managed Redis'
+                ELSE cd.meter_category
+            END
+
+        WHEN 'Networking' THEN
+            CASE
+                WHEN UPPER(cd.meter_sub_category) LIKE '%DATA TRANSFER%'
+                    OR UPPER(cd.meter_category) = 'BANDWIDTH'
+                THEN 'Data Transfer'
+                WHEN UPPER(cd.meter_category) LIKE '%LOAD BALANCER%' THEN 'Load Balancer'
+                WHEN UPPER(cd.meter_category) LIKE '%VPN%' THEN 'VPN Gateway'
+                WHEN UPPER(cd.meter_category) LIKE '%EXPRESSROUTE%' THEN 'ExpressRoute'
+                WHEN UPPER(cd.meter_category) LIKE '%FRONT DOOR%' THEN 'Front Door'
+                WHEN UPPER(cd.meter_category) LIKE '%CDN%' OR UPPER(cd.meter_category) LIKE '%CONTENT DELIVERY%' THEN 'CDN'
+                ELSE cd.meter_category
+            END
+
+        WHEN 'Block Storage' THEN
+            CASE
+                WHEN UPPER(cd.meter_sub_category) LIKE '%PREMIUM SSD%' THEN 'Premium SSD'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%STANDARD SSD%' THEN 'Standard SSD'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%STANDARD HDD%' OR UPPER(cd.meter_sub_category) LIKE '%STANDARD DISK%' THEN 'Standard HDD'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%ULTRA%' THEN 'Ultra Disk'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%SNAPSHOT%'
+                    OR UPPER(cd.meter_name) LIKE '%SNAPSHOT%'
+                THEN 'Snapshots'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%PAGE BLOB%' THEN 'Page Blob'
+                ELSE 'Managed Disks'
+            END
+
+        WHEN 'Commitments & Capacity' THEN
+            -- lvl3 = Commitment Type (aligned with GCP: Reserved CUD / Flex CUD)
+            CASE
+                WHEN UPPER(COALESCE(cd.pricing_model, '')) = 'RESERVATION' THEN 'Reservation'
+                WHEN UPPER(COALESCE(cd.pricing_model, '')) = 'SAVINGSPLAN' THEN 'Savings Plan'
+                ELSE cd.pricing_model
+            END
+
+        WHEN 'Marketplace' THEN
+            CASE
+                WHEN COALESCE(cd.publisher_name, '') != '' THEN cd.publisher_name
+                ELSE cd.meter_category
+            END
+        WHEN 'Serverless' THEN cd.meter_category
+        WHEN 'Security' THEN cd.meter_category
+        WHEN 'Others' THEN
+            CASE
+                WHEN UPPER(cd.meter_category) IN ('AZURE MONITOR', 'LOG ANALYTICS', 'INSIGHT AND ANALYTICS')
+                THEN 'Observability'
+                ELSE cd.meter_category
+            END
+        ELSE cd.meter_category
+    END AS csp_product_lvl3,
+
+    -- lvl 4: Product Detail
+    CASE cd.csp_product_lvl2
+        WHEN 'Compute' THEN
+            CASE
+                WHEN UPPER(cd.meter_sub_category) LIKE '%AMD%'
+                    OR UPPER(cd.meter_sub_category) LIKE 'DA%SERIES%'
+                    OR UPPER(cd.meter_sub_category) LIKE 'EA%SERIES%'
+                    OR UPPER(cd.meter_sub_category) LIKE 'FA%SERIES%'
+                THEN 'AMD'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%ARM%'
+                    OR UPPER(cd.meter_sub_category) LIKE '%AMPERE%'
+                    OR UPPER(cd.meter_sub_category) LIKE 'DP%SERIES%'
+                    OR UPPER(cd.meter_sub_category) LIKE 'EP%SERIES%'
+                THEN 'Arm'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%LICENSE%'
+                    OR UPPER(cd.meter_sub_category) LIKE '%DEDICATED%'
+                    OR UPPER(cd.meter_name) LIKE '%LICENSE%'
+                THEN 'N/A'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%V2%'
+                    OR UPPER(cd.meter_sub_category) LIKE '%V3%'
+                    OR UPPER(cd.meter_sub_category) LIKE '%V4%SERIES%'
+                    OR UPPER(cd.meter_sub_category) LIKE '%V5%SERIES%'
+                    OR UPPER(cd.meter_sub_category) LIKE '%V6%SERIES%'
+                    OR UPPER(cd.meter_sub_category) LIKE 'FX%'
+                    OR UPPER(cd.meter_sub_category) LIKE 'D/DS%'
+                    OR UPPER(cd.meter_sub_category) LIKE 'F/FS%'
+                    OR UPPER(cd.meter_sub_category) LIKE 'A SERIES%'
+                    OR UPPER(cd.meter_sub_category) LIKE 'B%SERIES%'
+                THEN 'Intel'
+                ELSE 'Intel/AMD'
+            END
+
+        WHEN 'AI' THEN
+            CASE
+                WHEN UPPER(cd.meter_category) LIKE '%OPENAI%'
+                    OR UPPER(cd.meter_sub_category) LIKE '%OPENAI%'
+                    OR UPPER(cd.meter_name) LIKE '%GPT%'
+                    OR UPPER(cd.meter_name) LIKE '%O1%'
+                    OR UPPER(cd.meter_name) LIKE '%O3%'
+                    OR UPPER(cd.meter_name) LIKE '%WHISPER%'
+                    OR UPPER(cd.meter_name) LIKE '%DALL-E%'
+                    OR UPPER(cd.meter_name) LIKE '%COMPUTER-USE%'
+                    OR UPPER(cd.meter_name) LIKE '%TEXT-EMBEDDING%'
+                    OR UPPER(cd.meter_name) LIKE '%CODEX%'
+                THEN 'OpenAI'
+                WHEN UPPER(cd.meter_name) LIKE '%CLAUDE%'
+                THEN 'Anthropic'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%NC%SERIES%'
+                    OR UPPER(cd.meter_sub_category) LIKE '%ND%SERIES%'
+                    OR UPPER(cd.meter_sub_category) LIKE '%NV%SERIES%'
+                THEN 'Nvidia'
+                ELSE 'Microsoft'
+            END
+
+        WHEN 'Storage' THEN
+            CASE
+                -- Geo-replication (most specific, must come FIRST - meter names can contain both GEO and DATA STORED)
+                WHEN UPPER(cd.meter_name) LIKE '%GEO-REPLICATION%'
+                    OR UPPER(cd.meter_name) LIKE '%GEO REPLICATION%'
+                THEN 'Geo Replication'
+                -- Data stored/provisioned (general storage)
+                WHEN UPPER(cd.meter_name) LIKE '%DATA STORED%'
+                    OR UPPER(cd.meter_name) LIKE '%PROVISIONED%'
+
+                THEN 'Storage'
+                -- Data transfer patterns (most specific first)
+                WHEN UPPER(cd.meter_name) LIKE '%INTER CONTINENT%'
+                    OR UPPER(cd.meter_name) LIKE '%INTER-CONTINENT%'
+                THEN 'Inter-Continent'
+                WHEN UPPER(cd.meter_name) LIKE '%INTRA CONTINENT%'
+                    OR UPPER(cd.meter_name) LIKE '%INTRA-CONTINENT%'
+                THEN 'Intra-Continent'
+                WHEN UPPER(cd.meter_name) LIKE '%DATA TRANSFER%'
+                    OR UPPER(cd.meter_name) LIKE '%EGRESS%'
+                THEN 'Data Transfer'
+                WHEN UPPER(cd.meter_name) LIKE '%OPERATIONS%'
+                    OR UPPER(cd.meter_name) LIKE '%TRANSACTIONS%'
+                    OR UPPER(cd.meter_name) LIKE '%RETRIEVAL%'
+                    OR UPPER(cd.meter_name) LIKE '%DELETE%'
+                    OR UPPER(cd.meter_name) LIKE '%ADDITIONAL IO%'
+                    OR UPPER(cd.meter_name) LIKE '%DATA WRITE%'
+                    OR UPPER(cd.meter_name) LIKE '%REPLICATED%'
+                    OR UPPER(cd.meter_name) LIKE '%PROCESSED%'
+                    OR UPPER(cd.meter_name) LIKE '%CHANGES%'
+                    OR UPPER(cd.meter_name) LIKE '%INDEX%'
+                THEN 'Operations'
+                WHEN UPPER(cd.meter_name) LIKE '%PROTECTED INSTANCES%' THEN 'Storage'
+                ELSE ''
+            END
+
+        WHEN 'Databases' THEN
+            CASE
+                WHEN UPPER(cd.meter_sub_category) LIKE '%GENERAL PURPOSE%' THEN 'General Purpose'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%BUSINESS CRITICAL%' THEN 'Business Critical'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%HYPERSCALE%' THEN 'Hyperscale'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%BURSTABLE%' THEN 'Burstable'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%BASIC%' THEN 'Basic'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%STANDARD%' THEN 'Standard'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%PREMIUM%' THEN 'Premium'
+                ELSE ''
+            END
+
+        WHEN 'Networking' THEN
+            CASE
+                WHEN UPPER(cd.meter_name) LIKE '%EGRESS%'
+                    OR UPPER(cd.meter_name) LIKE '%OUTBOUND%'
+                    OR UPPER(cd.meter_name) LIKE '%TRANSFER OUT%'
+                THEN 'Egress'
+                WHEN UPPER(cd.meter_name) LIKE '%INGRESS%'
+                    OR UPPER(cd.meter_name) LIKE '%INBOUND%'
+                    OR UPPER(cd.meter_name) LIKE '%TRANSFER IN%'
+                THEN 'Ingress'
+                ELSE ''
+            END
+
+        WHEN 'Block Storage' THEN
+            CASE
+                WHEN UPPER(cd.meter_name) LIKE '%PREMIUM%' THEN 'Performance'
+                WHEN UPPER(cd.meter_name) LIKE '%ULTRA%' THEN 'Performance'
+                WHEN UPPER(cd.meter_name) LIKE '%STANDARD%' THEN 'Standard'
+                WHEN UPPER(cd.meter_name) LIKE '%SNAPSHOT%' THEN 'Standard'
+                WHEN REGEXP_CONTAINS(cd.meter_name, r'P[0-9]+') THEN 'Performance'
+                WHEN REGEXP_CONTAINS(cd.meter_name, r'[ES][0-9]+') THEN 'Standard'
+                ELSE ''
+            END
+
+        WHEN 'Serverless' THEN
+            CASE
+                WHEN UPPER(cd.meter_sub_category) LIKE '%PREMIUM%' THEN 'Premium'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%ELASTIC PREMIUM%' THEN 'Premium'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%STANDARD%' THEN 'Standard'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%BASIC%' THEN 'Basic'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%FREE%' THEN 'Free'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%AUTOMATIC%' THEN 'Automatic'
+                ELSE ''
+            END
+
+        WHEN 'Commitments & Capacity' THEN
+            -- lvl4 = Duration (aligned with GCP: 1 year / 3 years)
+            CASE
+                WHEN cd.term = 1 THEN '1 Month' --TODO: validate cd.term is integer
+                WHEN cd.term = 12 THEN '1 Year'
+                WHEN cd.term = 36 THEN '3 Years'
+                WHEN cd.term IS NOT NULL THEN cd.term || ' Months'
+                ELSE ''
+            END
+
+        WHEN 'Others' THEN
+            CASE
+                WHEN UPPER(cd.meter_category) IN ('AZURE MONITOR', 'LOG ANALYTICS', 'INSIGHT AND ANALYTICS') THEN
+                    CASE
+                        -- Alerts first: "Alerts System Log Monitored" is an alert, not a log
+                        WHEN UPPER(cd.meter_name) LIKE '%ALERT%' THEN 'Alerts'
+                        WHEN UPPER(cd.meter_category) = 'LOG ANALYTICS'
+                            OR UPPER(cd.meter_name) LIKE '%LOG%' THEN 'Logs'
+                        WHEN UPPER(cd.meter_name) LIKE '%METRIC%' THEN 'Metrics'
+                        ELSE 'Other'
+                    END
+                ELSE ''
+            END
+
+        ELSE ''
+    END AS csp_product_lvl4,
+
+    -- lvl 5: Product Variant
+    CASE cd.csp_product_lvl2
+        WHEN 'Compute' THEN
+            CASE
+                -- M-series Medium Memory (e.g., "Msv3 Medium Memory Series Linux" → MSV3)
+                WHEN UPPER(cd.meter_sub_category) LIKE '%MEDIUM MEMORY SERIES%'
+                THEN REGEXP_EXTRACT(UPPER(cd.meter_sub_category), r'^([A-Z0-9]+)\s+MEDIUM', 1)
+                -- Hyphen-series (e.g., "FXmsv2-series Linux" → FXMSV2)
+                WHEN UPPER(cd.meter_sub_category) LIKE '%-SERIES%'
+                THEN REGEXP_EXTRACT(UPPER(cd.meter_sub_category), '([A-Z0-9]+)-SERIES', 1)
+                -- Standard pattern (e.g., "Dsv5 Series" → DSV5)
+                WHEN REGEXP_CONTAINS(UPPER(cd.meter_sub_category), r'([DEFBMLAGN][A-Z0-9]*V?[0-9]*)\s+SERIES')
+                THEN REGEXP_EXTRACT(UPPER(cd.meter_sub_category), r'([DEFBMLAGN][A-Z0-9]*V?[0-9]*)\s+SERIES', 1)
+                ELSE ''
+            END
+
+        WHEN 'AI' THEN
+            CASE
+                -- GPU VMs: extract series from meter_sub_category
+                WHEN UPPER(cd.meter_sub_category) LIKE '%NC%SERIES%' THEN REGEXP_EXTRACT(UPPER(cd.meter_sub_category), r'(NC.+?)\s+SERIES', 1)
+                WHEN UPPER(cd.meter_sub_category) LIKE '%ND%SERIES%' THEN REGEXP_EXTRACT(UPPER(cd.meter_sub_category), r'(ND.+?)\s+SERIES', 1)
+                WHEN UPPER(cd.meter_sub_category) LIKE '%NV%SERIES%' THEN REGEXP_EXTRACT(UPPER(cd.meter_sub_category), r'(NV.+?)\s+SERIES', 1)
+                WHEN UPPER(cd.meter_name) LIKE 'NC%' THEN REGEXP_EXTRACT(UPPER(cd.meter_name), r'(NC[A-Z0-9_]+)', 1)
+                WHEN UPPER(cd.meter_name) LIKE 'ND%' THEN REGEXP_EXTRACT(UPPER(cd.meter_name), r'(ND[A-Z0-9_]+)', 1)
+                WHEN UPPER(cd.meter_name) LIKE 'NV%' THEN REGEXP_EXTRACT(UPPER(cd.meter_name), r'(NV[A-Z0-9_]+)', 1)
+
+                -- Provisioned Managed: L5 = Provisioned Throughput
+                WHEN UPPER(cd.meter_name) LIKE '%PROVISIONED MANAGED%' THEN 'Provisioned Throughput'
+
+                -- GPT-5 family: most specific first (5.4 > 5.2 > 5.1 > 5 Mini > 5)
+                -- Note: 5.4/5.2/5.1 meter_names may not contain 'GPT' prefix
+                WHEN REGEXP_CONTAINS(LOWER(cd.meter_name), r'5\.4\b') THEN 'GPT-5.4'
+                WHEN REGEXP_CONTAINS(LOWER(cd.meter_name), r'5\.2\b') THEN 'GPT-5.2'
+                WHEN REGEXP_CONTAINS(LOWER(cd.meter_name), r'5\.1\s+codex\s+mini') THEN 'Codex Mini 5.1'
+                WHEN REGEXP_CONTAINS(LOWER(cd.meter_name), r'gpt\s*5\.1') THEN 'GPT-5.1'
+                WHEN REGEXP_CONTAINS(LOWER(cd.meter_name), r'gpt\s*5\s+mini') THEN 'GPT-5 Mini'
+                WHEN REGEXP_CONTAINS(LOWER(cd.meter_name), r'gpt\s*5\b')
+                    OR UPPER(cd.meter_sub_category) LIKE '%GPT5%'
+                THEN 'GPT-5'
+
+                -- GPT-4.1 family: nano > mini > base
+                WHEN REGEXP_CONTAINS(LOWER(cd.meter_name), r'gpt\s*4\.1\s+nano') THEN 'GPT-4.1 Nano'
+                WHEN REGEXP_CONTAINS(LOWER(cd.meter_name), r'gpt\s*4\.1\s+mini') THEN 'GPT-4.1 Mini'
+                WHEN REGEXP_CONTAINS(LOWER(cd.meter_name), r'gpt\s*4\.1') THEN 'GPT-4.1'
+
+                -- GPT-4o family: mini before base (both contain '4o')
+                WHEN REGEXP_CONTAINS(LOWER(cd.meter_name), r'gpt[\s-]*4o[\s-]+mini') THEN 'GPT-4o Mini'
+                WHEN REGEXP_CONTAINS(LOWER(cd.meter_name), r'gpt[\s-]*4o') THEN 'GPT-4o'
+
+                -- GPT-4 Turbo (128K context)
+                WHEN REGEXP_CONTAINS(LOWER(cd.meter_name), r'gpt-4-turbo') THEN 'GPT-4 Turbo'
+
+                -- GPT-4 base (8K context)
+                WHEN REGEXP_CONTAINS(LOWER(cd.meter_name), r'gpt-4-8k') THEN 'GPT-4'
+
+                -- GPT-3.5 Turbo
+                WHEN REGEXP_CONTAINS(LOWER(cd.meter_name), r'gpt-?35-turbo|gpt-?3\.5') THEN 'GPT-3.5 Turbo'
+
+                -- o3 family
+                WHEN REGEXP_CONTAINS(LOWER(cd.meter_name), r'o3[\s-]+mini') THEN 'o3 Mini'
+                WHEN UPPER(cd.meter_name) LIKE '%O3%' THEN 'o3'
+
+                -- Codex (non-5.1 variant if any)
+                WHEN REGEXP_CONTAINS(LOWER(cd.meter_name), r'codex[\s-]+mini') THEN 'Codex Mini 5.1'
+
+                -- Specialised OpenAI models
+                WHEN UPPER(cd.meter_name) LIKE '%COMPUTER-USE%' THEN 'Computer Use'
+                WHEN REGEXP_CONTAINS(LOWER(cd.meter_name), r'text-embedding-3-large') THEN 'Text Embedding 3 Large'
+                WHEN UPPER(cd.meter_name) LIKE '%WHISPER%' THEN 'Whisper'
+
+                -- Anthropic models
+                WHEN UPPER(cd.meter_name) LIKE '%CLAUDE%' THEN 'Claude'
+
+                -- Non-OpenAI AI services
+                WHEN UPPER(cd.meter_category) LIKE '%DATABRICKS%' THEN 'Databricks'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%SPEECH%' THEN 'Speech to Text'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%TRANSLATOR%' OR UPPER(cd.meter_category) LIKE '%TRANSLATOR%' THEN 'Translator'
+                WHEN UPPER(cd.meter_sub_category) LIKE '%CONTENT SAFETY%' OR UPPER(cd.meter_category) LIKE '%CONTENT SAFETY%' THEN 'Content Safety'
+
+                -- Fallback for other Foundry meters
+                WHEN UPPER(cd.meter_category) LIKE '%FOUNDRY%' THEN cd.meter_name
+                ELSE ''
+            END
+
+        WHEN 'Storage' THEN
+            -- lvl5 = Access tier only (Hot, Cool, Cold, Archive)
+            -- 'Premium' is a performance tier, not an access tier — map to 'Hot'
+            -- 'Standard' is a performance tier — leave blank
+            CASE
+                WHEN UPPER(cd.meter_name) LIKE '%HOT%' OR UPPER(cd.meter_sub_category) LIKE '%HOT%' THEN 'Hot'
+                WHEN UPPER(cd.meter_name) LIKE '%COOL%' OR UPPER(cd.meter_sub_category) LIKE '%COOL%' THEN 'Cool'
+                WHEN UPPER(cd.meter_name) LIKE '%COLD%' THEN 'Cold'
+                WHEN UPPER(cd.meter_name) LIKE '%ARCHIVE%' OR UPPER(cd.meter_sub_category) LIKE '%ARCHIVE%' THEN 'Archive'
+                WHEN UPPER(cd.meter_name) LIKE '%PREMIUM%' OR UPPER(cd.meter_sub_category) LIKE '%PREMIUM%' THEN 'Hot'
+                ELSE ''
+            END
+
+        WHEN 'Commitments & Capacity' THEN
+            -- lvl5 = Family (aligned with GCP: C4, H200)
+            CASE
+                WHEN UPPER(cd.meter_category) = 'VIRTUAL MACHINES' THEN
+                    CASE
+                        WHEN UPPER(cd.meter_sub_category) LIKE '%NC%SERIES%' THEN REGEXP_EXTRACT(UPPER(cd.meter_sub_category), r'(NC.+?)\s+SERIES', 1)
+                        WHEN UPPER(cd.meter_sub_category) LIKE '%ND%SERIES%' THEN REGEXP_EXTRACT(UPPER(cd.meter_sub_category), r'(ND.+?)\s+SERIES', 1)
+                        WHEN UPPER(cd.meter_sub_category) LIKE '%NV%SERIES%' THEN REGEXP_EXTRACT(UPPER(cd.meter_sub_category), r'(NV.+?)\s+SERIES', 1)
+                        WHEN UPPER(cd.meter_sub_category) LIKE '%MEDIUM MEMORY SERIES%'
+                        THEN REGEXP_EXTRACT(UPPER(cd.meter_sub_category), r'^([A-Z0-9]+)\s+MEDIUM', 1)
+                        WHEN UPPER(cd.meter_sub_category) LIKE '%-SERIES%'
+                        THEN REGEXP_EXTRACT(UPPER(cd.meter_sub_category), r'([A-Z0-9]+)-SERIES', 1)
+                        WHEN REGEXP_CONTAINS(UPPER(cd.meter_sub_category), r'([DEFBMLAGN][A-Z0-9]*V?[0-9]*)\s+SERIES')
+                        THEN REGEXP_EXTRACT(UPPER(cd.meter_sub_category), r'([DEFBMLAGN][A-Z0-9]*V?[0-9]*)\s+SERIES', 1)
+                        ELSE ''
+                    END
+                WHEN UPPER(cd.meter_sub_category) LIKE '%OPENAI%' THEN 'Foundry'
+                ELSE cd.meter_category
+            END
+
+        WHEN 'Databases' THEN
+            -- Clean encoding artifact: non-breaking space (Â / CHR(160)) in meter_sub_category
+            TRIM(REPLACE(REPLACE(REPLACE(cd.meter_sub_category, CHR(194), ''), CHR(160), ' '), '  ', ' '))
+        WHEN 'Block Storage' THEN
+            -- lvl5 = Resource dimension (aligned with GCP: Capacity, IOPS, Throughput)
+            CASE
+                WHEN UPPER(cd.meter_name) LIKE '%IOPS%' THEN 'IOPS'
+                WHEN UPPER(cd.meter_name) LIKE '%THROUGHPUT%' THEN 'Throughput'
+                WHEN UPPER(cd.meter_name) LIKE '%OPERATIONS%' THEN 'Operations'
+                WHEN UPPER(cd.meter_name) LIKE '%SNAPSHOT%' THEN 'Snapshots'
+                WHEN UPPER(cd.meter_name) LIKE '%VCPU%' THEN 'vCPU Reservation'
+                WHEN UPPER(cd.meter_name) LIKE '%CAPACITY%' THEN 'Capacity'
+                WHEN UPPER(cd.meter_name) LIKE '%DISK%' THEN 'Capacity'
+                ELSE cd.meter_sub_category
+            END
+        WHEN 'Networking' THEN cd.meter_sub_category
+        WHEN 'Serverless' THEN
+            -- lvl5 = Resource dimension (aligned with GCP: Pod, Cluster, Storage, Networking, Requests)
+            CASE
+                WHEN UPPER(cd.meter_name) LIKE '%VCPU%' OR UPPER(cd.meter_name) LIKE '%MEMORY%' THEN 'Pod'
+                WHEN UPPER(cd.meter_name) LIKE '%DATA STORED%' OR UPPER(cd.meter_name) LIKE '%STORAGE%' THEN 'Storage'
+                WHEN UPPER(cd.meter_name) LIKE '%DATA TRANSFER%' OR UPPER(cd.meter_name) LIKE '%INGRESS%'
+                    OR UPPER(cd.meter_name) LIKE '%EGRESS%'
+                THEN 'Networking'
+                WHEN UPPER(cd.meter_name) LIKE '%EXECUTION%' OR UPPER(cd.meter_name) LIKE '%REQUEST%'
+                    OR UPPER(cd.meter_name) LIKE '%ACTIONS%' OR UPPER(cd.meter_name) LIKE '%OPERATIONS%'
+                THEN 'Requests'
+                WHEN UPPER(cd.meter_name) LIKE '%THROUGHPUT%' THEN 'Throughput'
+                WHEN UPPER(cd.meter_name) LIKE '%RETENTION%' THEN 'Storage'
+                WHEN UPPER(cd.meter_name) LIKE '%REGISTRY UNIT%' OR UPPER(cd.meter_name) LIKE '%UPTIME%'
+                    OR UPPER(cd.meter_name) LIKE '%CONTROL PLANE%' OR UPPER(cd.meter_name) LIKE '%UNIT%'
+                THEN 'Cluster'
+                WHEN UPPER(cd.meter_name) LIKE '%APP%' THEN 'Instances'
+                WHEN UPPER(cd.meter_name) LIKE '%DOMAIN%' THEN 'Networking'
+                WHEN UPPER(cd.meter_category) = 'AZURE APP SERVICE' THEN 'Instances'
+                ELSE ''
+            END
+        WHEN 'Marketplace' THEN
+            CASE
+                WHEN COALESCE(cd.consumed_service, '') != '' THEN cd.consumed_service
+                WHEN cd.meter_sub_category = cd.meter_category THEN ''
+                ELSE cd.meter_sub_category
+            END
+        WHEN 'Others' THEN
+            CASE
+                WHEN UPPER(cd.meter_category) IN ('AZURE MONITOR', 'LOG ANALYTICS', 'INSIGHT AND ANALYTICS')
+                THEN cd.meter_category
+                ELSE cd.meter_sub_category
+            END
+        WHEN 'Security' THEN cd.meter_sub_category
+        ELSE ''
+    END AS csp_product_lvl5
+
+FROM ClassifiedData cd
