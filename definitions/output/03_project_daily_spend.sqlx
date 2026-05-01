@@ -88,9 +88,12 @@ SELECT
   SUM(total_net_cost) AS total_net_cost
 FROM
   ${ref("vw_gcp_billing_export_daily_summary")}
-        WHERE
-        ${when(incremental(),`usage_start_date IN UNNEST(v_usage_dates_processed)`,
-        `usage_start_date >= '${dataform.projectConfig.vars.default_start_date}'`)}
+WHERE
+  ${when(incremental(),`usage_start_date IN UNNEST(v_usage_dates_processed)`,
+  `usage_start_date >= '${dataform.projectConfig.vars.default_start_date}'`)}
+  AND project_id is not NULL
+  AND project_id != ''
+  AND NOT is_subscription
         
 GROUP BY
   1,

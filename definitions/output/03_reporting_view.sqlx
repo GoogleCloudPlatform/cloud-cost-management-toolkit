@@ -32,5 +32,12 @@ config {
 select daily.*
   , case when service_description != 'Invoice' then
   (total_cost+total_fcud_legacy-total_promotion)
-  else 0 end as total_net_cost 
+  else 0 end as total_net_cost,
+  , case when service_description in (
+    'Marketplace',
+    'Support',
+    'Chronicle'
+    -- add other subscription services here to centralize filter definition
+  ) THEN true ELSE false END AS is_subscription
+  )
 from ${ref(dataform.projectConfig.vars.daily_summary_table_name)} daily
