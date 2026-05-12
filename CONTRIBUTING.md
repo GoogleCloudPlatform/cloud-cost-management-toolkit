@@ -27,3 +27,22 @@ information on using pull requests.
 
 This project follows
 [Google's Open Source Community Guidelines](https://opensource.google/conduct/).
+
+## Local Development & Git Safety
+
+To protect the project from accidental leaks of private GCP Project IDs or billing table names, we enforce a "Zero-Config" policy for committed files. 
+
+The `workflow_settings.yaml` file in the repository root contains generic placeholders. **Please do not commit your private GCP project IDs or dataset configurations.**
+
+If you need to run the Dataform CLI locally or want to modify `workflow_settings.yaml` with your active GCP credentials for testing:
+
+1.  **Ignore local changes to the config**: Run this command immediately after cloning to ensure your local edits are never tracked by Git:
+    ```bash
+    git update-index --assume-unchanged workflow_settings.yaml
+    ```
+    This tells Git to ignore any local modifications to `workflow_settings.yaml`. You can safely enter your private credentials for testing without risking committing them.
+
+2.  **Re-enable tracking (if contributing template updates)**: If you are actively working on improving the base template structure of `workflow_settings.yaml` and need to commit structural changes to Git, run:
+    ```bash
+    git update-index --no-assume-unchanged workflow_settings.yaml
+    ```

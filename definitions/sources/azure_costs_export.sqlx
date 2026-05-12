@@ -17,6 +17,7 @@
 -- This file declares your source view, to access the raw billing export with a partition filter always enabled.
 -- Dataform now knows this view exists and other files can ${ref()} it.
 config {
+  disabled: dataform.projectConfig.vars.enable_azure === "false",
   type: "view",
   tags: ["createViews"],
   name: "azure_costs_export"

@@ -3,6 +3,8 @@ A SQL-based data engineering pipeline sourcing GCP Billing and Recommendations e
 
 Output tables are designed to improve the analytics experience by reducing query costs and speeding up slow analysis, unlocking many queries unattainable by accounts with high activity. Also includes optional add-ons of anomaly detection with BQML, cloud run function to orchestrate alerting of anomalies to slack, email, etc with AI generated next steps, plus a suite of Looker Studio report templates. Core deployment in any FinOps related PSO project, but also useful outside the context of PSO.
 
+This repository contains both the Dataform SQLX pipeline code and the Terraform module required to provision the Dataform environment in your GCP project.
+
 # Goals
 - No expensive matching rows/UPDATE operations. Always prune partitions. NO full table scans!
 - Maintain a "report-friendly" GCP billing export, separate from the raw billing export
@@ -14,7 +16,18 @@ Output tables are designed to improve the analytics experience by reducing query
 
 For more detailed design information, see the Pipeline and Dataform design docs.
 
-# Implementation
+# Implementation 
+Two pathways, with or without using Terraform
+
+## Prerequisites
+
+1.  **GCP Project**: A GCP project where you want to transform your billing data.
+2.  **GCP Billing Export**: Access to a raw billing export table (standard or detailed) in BigQuery (can be in the same project or a different one).
+3.  **Git Provider**: A public or private Git repository (e.g., GitHub, GitLab) hosting your clone/fork of this `ccm-toolkit` repository.
+4.  **Permissions**: Your deployment user must have Owner or Editor access to the target GCP project to perform manual actions or to run Terraform.
+
+## Implementation (without Terraform)
+
 Two parts. First, getting this solution code into your dataform. Second, making it work for your project.
 ### Installing in Dataform
 1. Clone or fork this repository to an online git service that you own (e.g. a new repository in your company's github org or a gitlab already networked to your GCP project). This will become the remote repository backing up your updates to this solution. If this is not possible, the instructions below will not apply (i.e. don't just make a local clone).
@@ -49,3 +62,85 @@ These instructions assume your organization is already [exporting its billing da
 [Optional] If your organization has also enabled the [Recommendations Export](https://docs.cloud.google.com/recommender/docs/bq-export/export-recommendations-to-bq), then complete these additional steps.
 
 1. In the workflow settings, uncomment and configure recommendations_table with name of your Recommendations export table setup via https://cloud.google.com/recommender/docs/bq-export/export-recommendations-to-bq
+
+
+## Implementation (with Terraform)
+
+### Phase 1: Infrastructure Provisioning (Terraform)
+
+We use Terraform to provision the Dataform repository, the required Service Account, and the BigQuery dataset where the output tables will be created.
+
+#### Step 1: Configure Terraform Variables
+1.  Navigate to the `terraform/` directory.
+2.  Copy the environment template to create your active `.tfvars` file:
+    ```bash
+    cp environments/nonprod.tfvars.template environments/nonprod.tfvars
+    ```
+3.  Configure the variables inside `environments/nonprod.tfvars`:
+    ```hcl
+    project_id             = "your-gcp-project-id"
+    environment            = "np" # np for non-prod, pd for prod
+    instance_id            = "" # leave blank if only handling one billing account/export
+    region                 = "us-central1"
+    location               = "US"
+    raw_billing_project_id = "your-raw-billing-project-id"
+    raw_billing_dataset_name = "your_raw_billing_dataset"
+    raw_billing_table_name   = "gcp_billing_export_v1_XXXXXX_XXXXXX_XXXXXX"
+    
+    # Git Integration
+    dataform_git_remote_url     = "git@github.com:your-org/ccm-toolkit.git"
+    ```
+
+#### Step 2: Run Terraform Apply
+Execute the apply command pointing to your environment-specific variables:
+```bash
+cd terraform
+terraform init
+terraform apply -var-file=environments/nonprod.tfvars
+```
+This will create:
+*   The BigQuery dataset `ccm_toolkit_<instance_id>` (e.g., `ccm_toolkit_account1`).
+*   The Dataform Service Account (`gsvc-ccm-dataform-<environment>`) with appropriate BigQuery roles.
+*   The GCP Dataform Repository connected to your Git remote.
+*   An SSH Keypair in Secret Manager for secure Git mirroring.
+
+### Step 3: Retrieve the Deploy Key
+After a successful apply, Terraform will output the public SSH deploy key. Copy this string from your terminal:
+```
+dataform_git_public_deploy_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQC..."
+```
+
+---
+
+### Phase 2: Git Integration & Dataform Configuration
+
+Now we link GCP Dataform to your Git provider and configure the pipeline parameters.
+
+#### Step 1: Add Deploy Key to your Git Provider (e.g., GitHub)
+1.  Go to your Git repository settings (e.g., on GitHub).
+2.  Navigate to **Deploy keys**.
+3.  Click **Add deploy key**.
+4.  Paste the SSH public key retrieved in Phase 1, Step 3.
+5.  **CRITICAL**: Check **"Allow write access"** (Dataform needs write access to push workspace changes back to your branch).
+
+#### Step 2: Configure `workflow_settings.yaml`
+1. The terraform apply will create a workflow_settings.yaml automatically (based on the variable settings in the tfvars file for the environment)! Simply commit and push that new file to the remote Git repository:
+    ```bash
+    git add workflow_settings.yaml
+    git commit -m "Configure Dataform workflow settings for environment"
+    git push origin main
+    ```
+
+---
+
+### Phase 3: First Execution
+
+1.  Open the **BigQuery -> Dataform** page in the Google Cloud Console.
+2.  Open your repository (e.g., `ccm-dataform-repository-np`).
+3.  Create or open a development workspace (e.g., `ccm-toolkit-oss-for-alert`).
+4.  Click **Pull from Remote** to pull the latest configurations you pushed in Phase 2.
+5.  Verify that the compilation status is **Green** (no compilation errors).
+6.  Click **Start Execution** and select **All Actions**.
+7.  Monitor the execution. Once completed, verify that the following tables have been successfully created and populated in your BigQuery output dataset (e.g., `gcp_billing_np`):
+    *   `usage_partitioned_billing_export`
+    *   `gcp_billing_export_daily_summary`

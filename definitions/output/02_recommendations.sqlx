@@ -15,7 +15,7 @@
 */
 
 config {
-  //disabled: true, // enable if your organization has setup the Recommendations Export
+  disabled: dataform.projectConfig.vars.enable_recommendations === "false",
   type: "table",
   dependencies: ["00_init_pipeline"],
   name: "gcp_billing_recommendations",
