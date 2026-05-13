@@ -15,7 +15,7 @@
 */
 
 config {
-  disabled: true,
+  disabled: dataform.projectConfig.vars.enable_azure === "false",
   type: "table",
   name: "azure_product_categories",
   description: "Example of generating a customer-specific Azure product hierarchy"

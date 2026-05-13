@@ -1,0 +1,42 @@
+# ============================================================================
+# CCM TOOLKIT - OPEN SOURCE GITIGNORE
+# ============================================================================
+
+# --- Dataform Local Configurations ---
+# NOTE: workflow_settings.yaml is NOT ignored because Dataform needs the file
+# to exist in Git to compile. To make local changes without committing them, run:
+# git update-index --assume-unchanged workflow_settings.yaml
+.df-credentials.json
+
+# --- Node / NPM (Local Dataform CLI testing) ---
+node_modules/
+package-lock.json
+yarn.lock
+
+# --- Terraform Local State & Configurations ---
+# Always ignore local provider cache, state, and private variable definitions.
+terraform/.terraform/
+terraform/terraform.tfvars
+terraform/environments/*.tfvars
+terraform/crash.log
+terraform/*.tfstate
+terraform/*.tfstate.*
+# terraform/.terraform.lock.hcl  # Optional: commit if you want to lock provider versions
+
+# --- General OS / IDE leftovers ---
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+
+# ============================================================================
+# CCM TOOLKIT - GITIGNORE
+# ============================================================================
+
+# --- Dataform Local Configurations ---
+# NOTE: workflow_settings.yaml is NOT ignored because Dataform needs the template
+# to exist in Git to compile. To make local changes without committing them, run:
+# git update-index --assume-unchanged workflow_settings.yaml
+.df-credentials.json
+
